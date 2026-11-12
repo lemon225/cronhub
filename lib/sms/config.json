@@ -1,0 +1,8 @@
+{
+  "apiUrl": "https://5gvas01.cmicmaap.com/gtw-ai/openclaw/msg/dyh/strongReminder/send2User",
+  "pid": "1403",
+  "name": "短信通知Skill",
+  "tpl": "g7v5ehhhdyawegqma8mb89uwt5b86yno",
+  "timeout": 30,
+  "key": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxF82XuySO+h5TWp8NfEo+2ht66P4q66fmNkmFBZNO1/wno4MXk/i6YGCeTHflV7ERG9+rMWGwo+tkH/WSLTIKQpvEZz0nKDuTQCwy21ZLcs5sD6WY4Eon2SuWA9Lv6k6uLdVd7ci3D6NTSgwVJeSVzgz6m68Z4WKKKijxMGh+LKrGG4XLvzaMaRBo/VKwW5bZjFdxkPTWNf0m/qd+WOjf4RBtjv9n5TTXvuVFH0hG4H4TkV6M9G4biCJseqZSPoYYeqPAqu0PaKudRSywoDTSnn1wTvmFoVYU65GkiDjjhJ4X9pdtbBJ+PyB1eb3U2Wxy0H4YeIfq7+F4FIAbpkGsQIDAQAB\n-----END PUBLIC KEY-----"
+}

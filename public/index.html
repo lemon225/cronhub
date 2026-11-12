@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CronHub · 定时任务控制中心</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232563eb'/%3E%3Ccircle cx='50' cy='50' r='26' fill='none' stroke='white' stroke-width='7'/%3E%3Cpath d='M50 50 V32' stroke='white' stroke-width='7' stroke-linecap='round'/%3E%3Cpath d='M50 50 L64 58' stroke='white' stroke-width='7' stroke-linecap='round'/%3E%3C/svg%3E">
+</head>
+<body>
+<!-- ============ 登录 / 首次设置密码 ============ -->
+<div class="auth" id="authScreen" hidden>
+  <div class="auth-card">
+    <div class="auth-brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="8.5"/><path d="M12 12V7.5"/><path d="M12 12l3.5 2.4"/>
+        </svg>
+      </div>
+      <h1>CronHub</h1>
+      <p id="authSubtitle">定时任务控制中心</p>
+    </div>
+
+    <div id="authLogin">
+      <div class="field">
+        <label>管理密码</label>
+        <input type="password" id="authPassword" placeholder="输入管理密码以启用管理面板" autocomplete="current-password">
+      </div>
+      <p class="auth-err" id="authErr"></p>
+      <button class="btn btn--primary btn--block" id="authLoginBtn">验证</button>
+      <button class="btn btn--ghost btn--block" id="authSkip" style="margin-top:8px">直接进入控制台</button>
+    </div>
+
+    <div id="authSetup" hidden>
+      <p class="auth-hint">当前实例已关闭密码访问，直接打开即可进入。</p>
+    </div>
+
+    <p class="auth-foot">数据保存在你自己的服务端，不经过第三方</p>
+  </div>
+</div>
+
+<div class="app" id="appRoot" hidden>
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="8.5"/><path d="M12 12V7.5"/><path d="M12 12l3.5 2.4"/>
+        </svg>
+      </div>
+      <div>
+        <h1>CronHub</h1>
+        <p>定时任务控制中心</p>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button class="nav-item is-active" data-view="overview">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg>
+        <span>总览</span>
+      </button>
+      <button class="nav-item" data-view="tasks">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 5h9M9 12h9M9 19h9"/><circle cx="4.5" cy="5" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.5" cy="19" r="1.3" fill="currentColor" stroke="none"/></svg>
+        <span>任务</span>
+        <em class="nav-badge" id="taskCount">0</em>
+      </button>
+      <button class="nav-item" data-view="inbox">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8a6 6 0 10-12 0c0 6-2 7-2 7h16s-2-1-2-7"/><path d="M10.5 20a1.8 1.8 0 003 0"/></svg>
+        <span>通知</span>
+        <em class="nav-badge nav-badge--alert" id="unreadCount" hidden>0</em>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1A1.7 1.7 0 006.9 19a1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1A1.7 1.7 0 002.5 15a1.7 1.7 0 00-1.5-1H1a2 2 0 110-4h.1A1.7 1.7 0 002.5 9a1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1A1.7 1.7 0 006.9 4a1.7 1.7 0 001-1.5V2a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9 1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>
+        <span>设置</span>
+        <em class="nav-badge nav-badge--alert" id="settingsAlert" hidden>!</em>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="srv-status">
+        <span class="dot" id="srvDot"></span>
+        <span id="srvText">连接中…</span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <button class="view-back" id="viewBack" hidden title="返回设置">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 5l-7 7 7 7"/></svg>
+          设置
+        </button>
+        <h2 id="viewTitle">总览</h2>
+        <p id="viewSub">实时掌握所有定时任务的运行状态</p>
+      </div>
+      <div class="topbar-right">
+        <div class="clock" id="clock">--:--:--</div>
+        <button class="btn btn--ghost" id="refreshBtn" title="刷新数据">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v6h-6"/></svg>
+        </button>
+        <button class="btn btn--primary" id="newTaskBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          新建任务
+        </button>
+      </div>
+    </header>
+
+    <div class="content">
+
+      <!-- ============ 总览 ============ -->
+      <section class="view is-active" id="view-overview">
+        <div class="stats" id="stats"></div>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head">
+              <h3>即将执行</h3>
+              <span class="hint">按触发时间排序</span>
+            </div>
+            <div class="next-list" id="nextList"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h3>最近动态</h3>
+              <button class="link-btn" data-goto="logs">全部日志</button>
+            </div>
+            <div class="feed" id="feed"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 保活 ============ -->
+      <section class="view" id="view-keep">
+        <div class="keep-head">
+          <div class="keep-head-actions">
+            <span class="keep-health" id="keepHealth"><i class="sdot is-off"></i>读取中…</span>
+            <button class="btn btn--ghost btn--sm" id="keepRefresh">刷新</button>
+          </div>
+        </div>
+
+        <div class="srv-runtime" id="srvRuntime"></div>
+
+        <div class="keep-tiles" id="keepTiles"></div>
+
+        <div class="card kw-card" id="kwSelfCard">
+          <div class="card-head">
+            <h3><span class="kw-no">1</span>内置自探活</h3>
+            <span class="kw-state" id="kw1State">未启用</span>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label>探活地址</label>
+              <div class="field-row" style="flex-wrap:nowrap">
+                <input type="text" id="keepAliveUrl" readonly>
+                <button class="btn btn--ghost btn--sm" id="copyKeepAlive" style="flex:none">复制</button>
+              </div>
+            </div>
+            <div class="field field--narrow">
+              <label>间隔（分钟）</label>
+              <input type="number" id="kwInterval" min="1" max="60" step="1" value="2">
+            </div>
+          </div>
+          <div class="field field--inline">
+            <label class="switch">
+              <input type="checkbox" id="kwEnabled">
+              <span class="track"></span>
+              <span class="switch-text">启用自探活 —— 减少空档（建议同时配下面的外部定时器）</span>
+            </label>
+          </div>
+          <div class="row-actions">
+            <button class="btn btn--primary btn--sm" id="saveKeepWarm">保存并生效</button>
+            <button class="btn btn--ghost btn--sm" id="kwPingNow">立即探活一次</button>
+          </div>
+          <p class="field-note" id="kw1Detail"></p>
+          <p class="field-note" id="kwStateNote"></p>
+        </div>
+
+        <div class="card kw-card" id="kwWakeCard">
+          <div class="card-head">
+            <h3><span class="kw-no">2</span>外部唤醒链接<span class="kw-must">必配</span></h3>
+            <span class="kw-state" id="kw2State">—</span>
+          </div>
+          <p class="field-note" style="margin-top:-2px">实例停掉后进程完全停摆、自己叫不醒自己 —— 这是唯一能把它打醒的手段。这条链接每次被访问都会顺手跑一次调度，到期的任务当场执行。</p>
+          <div class="field">
+            <label>唤醒地址（带令牌，交给外部定时器）</label>
+            <div class="field-row" style="flex-wrap:nowrap">
+              <input type="text" id="wakeUrl" readonly>
+              <button class="btn btn--ghost btn--sm" id="copyWakeUrl" style="flex:none">复制</button>
+              <button class="btn btn--ghost btn--sm" id="openWakeUrl" style="flex:none">测一次</button>
+            </div>
+          </div>
+          <div class="row-actions">
+            <button class="btn btn--ghost btn--sm btn--danger" id="regenWake">重置令牌（旧链接作废）</button>
+          </div>
+          <details class="keep-howto">
+            <summary>怎么配外部定时器（3 步，免费）</summary>
+            <ol>
+              <li>打开 <code>cron-job.org</code> 注册（或用 UptimeRobot / 手机快捷指令 / 另一台机器的 crontab）。</li>
+              <li>新建监控，URL 粘贴上面这条唤醒地址，间隔选 <strong>1 分钟</strong>，不用加任何 Header。</li>
+              <li>保存后等 1–2 分钟，回到这页看「外部唤醒」次数是否 +1。</li>
+              <li>这个托管环境空闲约 1 分钟就停容器，所以间隔填 1 分钟最稳；间隔越长，中间的空档越长。</li>
+            </ol>
+          </details>
+          <p class="field-note" id="wakeStats"></p>
+        </div>
+
+        <div class="card kw-card kw-card--soft" id="kwPageCard">
+          <div class="card-head">
+            <h3><span class="kw-no kw-no--soft">3</span>页面心跳</h3>
+            <span class="kw-state" id="kw3State">随页面开关</span>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label class="switch">
+                <input type="checkbox" id="kwPageEnabled">
+                <span class="track"></span>
+                <span class="switch-text">控制台打开时定时探活</span>
+              </label>
+            </div>
+            <div class="field field--narrow">
+              <label>间隔（秒）</label>
+              <input type="number" id="kwPageSec" min="10" max="300" step="5" value="30">
+            </div>
+            <div class="field" style="flex:0 0 auto;justify-content:flex-end">
+              <button class="btn btn--primary btn--sm" id="savePageBeat">保存</button>
+            </div>
+          </div>
+          <p class="field-note" id="kwPageDetail">页面开着时每 30 秒打一次健康检查；切到后台或关页面自动停。人在电脑前时的第三道兜底。</p>
+        </div>
+
+        <div class="grid-2 grid-2--even">
+          <div class="card">
+            <div class="card-head">
+              <h3>保活日志</h3>
+              <button class="btn btn--ghost btn--sm btn--danger" id="clearKeepLog">清空</button>
+            </div>
+            <div class="relay-list" id="keepLog"><div class="hint hint--block">暂无记录</div></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>运行记录</h3><span class="hint">最近 5 段</span></div>
+            <div class="relay-list" id="keepSegments"><div class="hint hint--block">暂无记录</div></div>
+            <p class="field-note">断档超过 3 分钟才判定为一次中断（休眠或重启）。连续运行时长跨重启累计，发版不会清零。</p>
+          </div>
+        </div>
+      </section>
+      <!-- ============ 任务 ============ -->
+      <section class="view" id="view-tasks">
+        <div class="filter-bar">
+          <div class="segmented" id="taskFilter">
+            <button class="is-active" data-filter="all">全部</button>
+            <button data-filter="http">HTTP 请求</button>
+            <button data-filter="remind">提醒</button>
+            <button data-filter="enabled">运行中</button>
+            <button class="seg-action" data-act="tasklogs" title="查看所有任务的历史执行记录">执行日志</button>
+          </div>
+          <div class="search-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+            <input type="text" id="taskSearch" placeholder="搜索任务名称">
+          </div>
+          <!-- 多选框平时隐藏，需要批量操作时从这里进入；放在 #taskFilter 外，免得被当成筛选项 -->
+          <button class="btn btn--ghost btn--sm" id="batchMode" type="button" aria-pressed="false" title="显示多选框，批量启用 / 停用 / 删除任务">批量</button>
+        </div>
+        <div class="batch-bar" id="batchBar" hidden>
+          <span>已选 <strong id="batchN">0</strong> 个任务</span>
+          <button class="btn btn--ghost btn--sm" id="batchEnable">批量启用</button>
+          <button class="btn btn--ghost btn--sm" id="batchDisable">批量停用</button>
+          <button class="btn btn--ghost btn--sm btn--danger" id="batchDelete">批量删除</button>
+          <button class="btn btn--ghost btn--sm" id="batchClear">取消选择</button>
+        </div>
+        <p class="list-hint" id="sortHint">按住卡片别动，手一震后再上下拖动可调整顺序，松手自动保存</p>
+        <div class="task-list" id="taskList"></div>
+      </section>
+
+      <!-- ============ 通知 ============ -->
+      <section class="view" id="view-inbox">
+        <div class="channel-bar" id="channelBar"></div>
+        <div class="filter-bar">
+          <div class="segmented" id="inboxFilter">
+            <button class="is-active" data-filter="all">全部</button>
+            <button data-filter="unread">未读</button>
+            <button data-filter="remind">提醒</button>
+            <button data-filter="error">告警</button>
+            <button class="seg-action" data-act="tasklogs" title="查看所有任务的历史执行记录">执行日志</button>
+          </div>
+          <div class="row-actions">
+            <button class="btn btn--ghost btn--sm" id="markAllRead">全部已读</button>
+            <button class="btn btn--ghost btn--sm btn--danger" id="clearInbox">清空</button>
+          </div>
+        </div>
+        <div class="inbox" id="inbox"></div>
+      </section>
+
+      <!-- ============ 日志 ============ -->
+      <section class="view" id="view-logs">
+        <div class="sysinfo" id="sysInfoBar"></div>
+
+        <div class="card card--flush" id="sysLogPane">
+          <div class="card-head">
+            <h3>系统日志 <span class="hint" id="sysLogCount"></span></h3>
+            <div class="row-actions">
+              <button class="btn btn--ghost btn--sm" id="sysLogRefresh">刷新</button>
+              <button class="btn btn--ghost btn--sm" id="sysLogExport">导出</button>
+              <button class="btn btn--ghost btn--sm btn--danger" id="sysLogClear">清空</button>
+            </div>
+          </div>
+          <div class="log-toolbar">
+            <div class="segmented" id="sysLogLevel">
+              <button class="is-active" data-lv="all">全部</button>
+              <button data-lv="error">错误</button>
+              <button data-lv="warn">警告</button>
+              <button data-lv="info">信息</button>
+            </div>
+            <select id="sysLogSource"><option value="all">全部来源</option></select>
+            <div class="search-box">
+              <input type="text" id="sysLogSearch" placeholder="搜关键字：休眠 / 内存 / 路径 / 任务名 / 错误信息">
+            </div>
+            <label class="switch switch--compact">
+              <input type="checkbox" id="sysLogAuto" checked>
+              <span class="track"></span>
+              <span class="switch-text">自动刷新</span>
+            </label>
+          </div>
+          <div class="log-list" id="sysLogList"></div>
+        </div>
+      </section>
+
+      <!-- ============ 设置 ============ -->
+      <section class="view" id="view-settings">
+        <div class="card" id="srvInfoCard">
+          <div class="card-head"><h3>服务器</h3><span class="hint" id="srvStateHint">运行中</span></div>
+          <div class="srv-lines" id="srvLines"></div>
+        </div>
+
+        <!--
+          双向陪护（第十批）：第九批在服务端做了「网站 ↔ Cloudflare」互相体检，
+          但结果只在 /api/health 里，控制中心一个字都看不到。
+          这里默认折叠只占一行，卡头直接给总体结论；展开才看四项细节。
+          用原生 <details>，renderCompanion() 只改文本、不重建 DOM，
+          45 秒轮询与页面编辑状态都不会把用户展开的卡收回去。
+        -->
+        <details class="card cmp-card" id="companionCard">
+          <summary class="cmp-summary">
+            <i class="sdot is-off" id="cmpDot"></i>
+            <span class="cmp-title">网站 ↔ Cloudflare 双向陪护</span>
+            <span class="hint" id="cmpBrief">读取中…</span>
+            <span class="cmp-caret" aria-hidden="true"></span>
+          </summary>
+          <div class="cmp-body">
+            <div class="cmp-grid">
+              <div class="cmp-item">
+                <span class="cmp-k">上游短信网关</span>
+                <span class="cmp-v" id="cmpUpstream">—</span>
+                <span class="cmp-n" id="cmpUpstreamNote"></span>
+              </div>
+              <div class="cmp-item">
+                <span class="cmp-k">中继回探本站</span>
+                <span class="cmp-v" id="cmpSite">—</span>
+                <span class="cmp-n" id="cmpSiteNote"></span>
+              </div>
+              <div class="cmp-item">
+                <span class="cmp-k">最近一次体检</span>
+                <span class="cmp-v" id="cmpAt">—</span>
+                <span class="cmp-n" id="cmpAtNote"></span>
+              </div>
+              <div class="cmp-item">
+                <span class="cmp-k">Cloudflare 唤醒</span>
+                <span class="cmp-v" id="cmpWake">—</span>
+                <span class="cmp-n" id="cmpWakeNote"></span>
+              </div>
+            </div>
+            <div class="row-actions cmp-actions">
+              <button class="btn btn--ghost btn--sm" id="cmpGuardBtn">立即体检</button>
+              <span class="field-note" id="cmpGuardNote">只读探针：不发短信、不触发任务调度。</span>
+            </div>
+            <p class="field-note cmp-foot">网关对探针返回 403 是正常的，判据看「连通」而非状态码。Pages 中继是唯一短信出口，双向陪护只负责尽早发现故障，不是备用线路。</p>
+          </div>
+        </details>
+
+        <div class="set-sec">
+          <h3>通知通道</h3>
+          <p>点标题展开配置，收起后只留一行；任务和通知里显示的是方案名（NotifyMe、Bark、飞书…），不写「Webhook」。</p>
+        </div>
+
+        <div class="grid-2 grid-2--even ch-grid">
+          <div class="card card--span2" id="smsCard">
+            <div class="ch-nav" data-type="sms"></div>
+
+            <!-- 一行看清状态；主操作就在旁边，不用翻页找按钮 -->
+            <div class="sms-top">
+              <span class="sms-state-dot" id="smsStateDot"></span>
+              <span class="sms-state-text" id="smsStateText">状态读取中…</span>
+              <button class="btn btn--ghost btn--xs" id="smsResumeBtn" hidden>恢复接收</button>
+            </div>
+            <div class="sms-brief" id="smsBrief" hidden></div>
+
+            <!--
+              接收号码列表：每个号码一份独立授权（平台把授权绑在 clawUid+uuid 上）。
+              多绑一个号 = 多扫一次码，各号状态互不影响。
+            -->
+            <div class="sms-binds" id="smsBinds" hidden></div>
+
+            <div class="sms-switches">
+              <label class="switch">
+                <input type="checkbox" id="smsEnabled">
+                <span class="track"></span>
+                <span class="switch-text">启用短信</span>
+              </label>
+              <label class="switch" title="短信里附一个免登录链接，手机端点开就能静音或退订">
+                <input type="checkbox" id="smsActionLink">
+                <span class="track"></span>
+                <span class="switch-text">带操作链接</span>
+              </label>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label>发哪些通知</label>
+                <select id="smsMinLevel">
+                  <option value="important">仅重要（失败 / 告警 / 提醒）</option>
+                  <option value="all">全部（成功也发）</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>正文上限</label>
+                <select id="smsMaxChars">
+                  <option value="67">67 字 · 1 条</option>
+                  <option value="134">134 字 · 2 条（推荐）</option>
+                  <option value="201">201 字 · 3 条</option>
+                  <option value="480">480 字 · 不限制</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="sms-acts">
+              <button class="btn btn--primary btn--sm" id="saveSms">保存</button>
+              <button class="btn btn--ghost btn--sm" id="testSms">发送测试</button>
+              <button class="btn btn--ghost btn--sm" id="smsAuthBtn">扫码授权</button>
+            </div>
+
+            <!--
+              授权结果独立成块：上面的状态区每次自动刷新都会整段重写，
+              结果写在那里会被 45 秒一次的刷新立刻擦掉（这就是上一版「点了没反应」的观感）。
+            -->
+            <div class="sms-auth-result" id="smsAuthResult" hidden></div>
+
+            <!--
+              发送通道与诊断全部收进折叠块：日常只关心「状态 + 三个按钮」，
+              中继配置、SNI 实验、连通性探测都是排障时才看的东西。
+            -->
+            <details class="sms-adv" id="smsRelayDetails">
+              <summary>发送通道与诊断（中继 / SNI / 连通性）</summary>
+
+            <!-- 短信发送中继：默认可见，不用展开技术细节 -->
+            <div class="sms-preview" id="smsGatewayRelayBlock">
+              <div class="sms-preview-head"><span>发送中继（可选）</span><span class="hint" id="sgrState">未启用</span></div>
+              <div class="field field--inline">
+                <label class="switch">
+                  <input type="checkbox" id="sgrEnabled">
+                  <span class="track"></span>
+                  <span class="switch-text">启用中继发送</span>
+                </label>
+              </div>
+              <div class="field">
+                <label>中继地址（只填域名）</label>
+                <input type="text" id="sgrUrl" placeholder="https://xxx.pages.dev" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field">
+                <label>备用地址（可选）</label>
+                <input type="text" id="sgrUrls" placeholder="主地址不通时自动切换，多个用逗号分隔" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field">
+                <label>中继密钥</label>
+                <input type="password" id="sgrSecret" placeholder="留空保留原值" autocomplete="new-password">
+              </div>
+              <div class="row-actions">
+                <button class="btn btn--primary btn--sm" id="sgrSave">保存</button>
+                <button class="btn btn--ghost btn--sm" id="sgrTest">测试连通</button>
+              </div>
+              <p class="field-note" id="sgrNote">留空即直连网关。路径、加密体、令牌原样保留；密钥只用于中继鉴权，不会转发到网关。</p>
+              <p class="field-note" id="sgrEndpoints"></p>
+            </div>
+
+            <!--
+              白名单 SNI 伪装：已实测否证，保留仅作诊断。
+              云端对 6 组 SNI（原名/无/百度/idaas/notifyme/cloudflare）全部在 ClientHello 阶段被
+              ECONNRESET（25–36ms），拦截在目的 IP / 出口来源层，改 SNI 绕不过。见 2026-11-08 记录。
+            -->
+            <div class="sms-preview" id="smsGatewaySniBlock">
+              <div class="sms-preview-head"><span>SNI 伪装（实验 · 已否证）</span><span class="hint" id="sgsState">未启用</span></div>
+              <div class="field field--inline">
+                <label class="switch">
+                  <input type="checkbox" id="sgsEnabled">
+                  <span class="track"></span>
+                  <span class="switch-text">启用白名单 SNI（实测无效，建议保持关闭）</span>
+                </label>
+              </div>
+              <div class="field">
+                <label>伪装域名（云端能 TLS 连通的主机名）</label>
+                <input type="text" id="sgsSni" placeholder="www.baidu.com" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="row-actions">
+                <button class="btn btn--primary btn--sm" id="sgsSave">保存</button>
+                <button class="btn btn--ghost btn--sm" id="sgsTest">跑 SNI 对照探针</button>
+              </div>
+              <p class="field-note" id="sgsNote">已实测否证（2026-11-08）：云端依次用 6 组 SNI 握手，全部在 25–36ms 内被 ECONNRESET，说明拦截发生在 TLS 之前、按目的 IP 或出口来源判定，改 SNI 无法绕过。发送请走上面的「发送中继」。探针保留仅供日后网关策略变化时复查。</p>
+            </div>
+
+            <div class="row-actions">
+              <button class="btn btn--ghost btn--sm" id="smsDiag">诊断连通性</button>
+            </div>
+            <div class="field-note" id="smsAuthState">这里只展示状态与计数，不含任何令牌值。</div>
+            </details>
+
+            <details class="sms-adv">
+              <summary>预览、额度与技术细节</summary>
+
+              <div class="sms-preview">
+                <div class="sms-preview-head"><span>发送效果</span><span class="hint" id="smsPreviewLen">—</span></div>
+                <pre id="smsPreviewBody">—</pre>
+                <div class="field-note" id="smsPreviewTips" hidden></div>
+              </div>
+
+              <div class="sms-preview">
+                <div class="sms-preview-head">
+                  <span>发送记录（近 8 条）</span>
+                  <button class="btn btn--ghost btn--xs" id="smsRecordsClear" data-need-admin title="只清记录，不影响发送">清空</button>
+                </div>
+                <div id="smsRecordsBody" class="sms-records-body">—</div>
+                <p class="field-note">记录只存「摘要 + 结果 + 条数」，不保存短信全文（正文常有验证码等敏感内容）。</p>
+              </div>
+
+              <div class="sms-preview" id="smsAgentNote">
+                <div class="sms-preview-head"><span>发送方式</span></div>
+                <div class="sms-records-body">服务端直接调用发送接口；若上方配置了中继，则经中继转发，不经过本机代理。</div>
+              </div>
+
+              <div class="sms-meter" id="smsCredBar">
+                <span class="sms-meter-item"><span class="sms-meter-k">凭据</span><span class="sms-meter-v" id="smCredState">读取中…</span></span>
+                <span class="sms-meter-item"><span class="sms-meter-k">令牌</span><span class="sms-meter-v" id="smCredToken">—</span></span>
+                <span class="sms-meter-item"><span class="sms-meter-k">今日刷新</span><span class="sms-meter-v" id="smCredRefresh">—</span></span>
+                <span class="sms-meter-item"><span class="sms-meter-k">今日发送</span><span class="sms-meter-v" id="smCredSend">—</span></span>
+                <span class="sms-meter-item"><span class="sms-meter-k">今日授权</span><span class="sms-meter-v" id="smCredAuth">—</span></span>
+              </div>
+
+              <div class="sms-admin" id="smsAdminBar">
+                <span class="sms-admin-role" id="smsAdminRole">🔓 免认证</span>
+                <span class="hint" id="smsAdminHint">短信操作直接生效，只计数不拦人</span>
+                <button class="btn btn--ghost btn--xs" id="smsAdminBtn" data-admin-gate>管理员登录</button>
+              </div>
+
+              <div class="row-actions">
+                <button class="btn btn--ghost btn--xs" id="smsResetBtn" data-need-admin title="清空用户身份凭据并熔断，不可撤销">吊销凭据</button>
+              </div>
+
+              <p class="field-note">
+                <strong>本地额度只是提示</strong>：发送 20 条/天、刷新 24 次/天、授权 10 次/天，超了会提醒但仍会执行；只有「熔断」是硬拦（平台风控，不拦会被封）。<br>
+                <strong>没有 refresh_token</strong>：授权是一次性绑定，绑定后按需取 5 分钟短效令牌，能复用就不刷新。
+              </p>
+            </details>
+          </div>
+
+          <div class="card" id="webhookCard">
+            <div class="ch-nav" data-type="webhook"></div>
+            <div class="card-head card-head--slim"><span class="hint">NotifyMe、Server酱、飞书、钉钉、Bark</span></div>
+            <div class="field">
+              <label>推送格式</label>
+              <select id="whFormat">
+                <option value="notifyme">NotifyMe（手机推送）</option>
+                <option value="generic">通用 JSON</option>
+                <option value="serverchan">Server酱</option>
+                <option value="feishu">飞书机器人</option>
+                <option value="dingtalk">钉钉机器人</option>
+                <option value="bark">Bark (iOS)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Webhook 地址</label>
+              <input type="text" id="whUrl" placeholder="https://...">
+            </div>
+            <!-- NotifyMe 用下面那组专用凭据字段；其他格式用这个通用 Token -->
+            <div class="field" id="whTokenField">
+              <label id="whTokenLabel">鉴权 Token（可选）</label>
+              <input type="text" id="whToken" placeholder="目标服务用请求头鉴权时才填，随请求加 Authorization: Bearer 头">
+              <p class="field-note" id="whTokenHint">Server酱 / 飞书 / 钉钉 / Bark 的「token」本身就是地址的一部分，直接粘完整地址即可，不用另填。</p>
+            </div>
+
+            <div id="whCredFields" hidden>
+              <div class="field">
+                <label>NotifyMe UUID（推荐）</label>
+                <input type="text" id="whUuid" placeholder="22 位，走新版网关 notifyme-server.wzn556.top" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field">
+                <label>NotifyMe FCM Token</label>
+                <input type="text" id="whFcm" placeholder="含冒号，走旧版网关 send-notifyme.521933.xyz" autocomplete="off" spellcheck="false">
+              </div>
+              <p class="field-note" id="whCredNote">两套凭据互不通用，<strong>只填一个</strong>：填 UUID 走新版网关，填 FCM token 走旧版。地址留空会自动选对应网关，不用手填；混填会报 <code>invalid UUID</code>（网关把 token 当 UUID 解析）。</p>
+            </div>
+
+            <!--
+              NotifyMe 高级选项：这些字段都进请求体的内层 data，
+              手机侧靠它们决定「能不能展开、点了去哪、要不要响」。
+              只对 notifyme 格式显示 —— 其他方案（Bark/飞书）没有这些概念。
+            -->
+            <div id="whAdvFields" hidden>
+              <div class="nm-adv-head">NotifyMe 高级选项<span>大文本 / 点击 / 复制 / 打开</span></div>
+              <div class="field field--inline">
+                <label class="switch">
+                  <input type="checkbox" id="whBigText" checked>
+                  <span class="track"></span>
+                  <span class="switch-text">大文本：通知栏展开多行</span>
+                </label>
+                <p class="field-note field-note--tight">关掉后长正文会被收成一行，要在通知栏直接看全就保持开启。</p>
+              </div>
+              <div class="field">
+                <label>点击通知时</label>
+                <select id="whActionType">
+                  <option value="0">不动作（只是展示）</option>
+                  <option value="1">打开链接</option>
+                  <option value="2">打开应用</option>
+                  <option value="4">复制到剪贴板（收到即写）</option>
+                  <option value="5">提取验证码（收到即抓数字）</option>
+                </select>
+              </div>
+              <div class="field" id="whActionField" hidden>
+                <label id="whActionLabel">链接地址</label>
+                <input type="text" id="whAction" placeholder="https://example.com" autocomplete="off" spellcheck="false">
+                <p class="field-note" id="whActionHint">点通知直接打开这个网址。</p>
+              </div>
+              <div class="field">
+                <label>通知分组（可选）</label>
+                <input type="text" id="whGroup" placeholder="留空 = 不分组，每条独立占一行（推荐）" autocomplete="off" spellcheck="false">
+                <p class="field-note">填了分组名，Android 会把同组通知折成一条摘要 —— 想看全就别填。</p>
+              </div>
+              <div class="field field--inline">
+                <label class="switch">
+                  <input type="checkbox" id="whUrgent">
+                  <span class="track"></span>
+                  <span class="switch-text">紧急提醒（持续响铃）</span>
+                </label>
+              </div>
+              <div class="row-actions">
+                <button class="btn btn--ghost btn--sm" id="whPrevBtn" type="button">预览请求体</button>
+              </div>
+              <pre class="nm-preview" id="whPreview" hidden></pre>
+            </div>
+            <div class="field field--inline">
+              <label class="switch">
+                <input type="checkbox" id="whEnabled">
+                <span class="track"></span>
+                <span class="switch-text">启用 Webhook</span>
+              </label>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn--primary btn--sm" id="saveWebhook">保存</button>
+              <button class="btn btn--ghost btn--sm" id="testWebhook">发送测试</button>
+            </div>
+          </div>
+
+          <div class="card" id="smtpCard">
+            <div class="ch-nav" data-type="email"></div>
+            <div class="card-head card-head--slim"><span class="hint">SMTP 直连，无需第三方服务</span></div>
+            <div class="field-row">
+              <div class="field"><label>SMTP 服务器</label><input type="text" id="smtpHost" placeholder="smtp.qq.com"></div>
+              <div class="field field--narrow"><label>端口</label><input type="number" id="smtpPort" value="465"></div>
+            </div>
+            <div class="field-row">
+              <div class="field"><label>账号</label><input type="text" id="smtpUser" placeholder="you@qq.com"></div>
+              <div class="field"><label>授权码 / 密码</label><input type="password" id="smtpPass" placeholder="不是登录密码"></div>
+            </div>
+            <div class="field"><label>收件人</label><input type="text" id="smtpTo" placeholder="多个用逗号分隔"></div>
+            <div class="field field--inline">
+              <label class="switch">
+                <input type="checkbox" id="smtpEnabled">
+                <span class="track"></span>
+                <span class="switch-text">启用邮件通道</span>
+              </label>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn--primary btn--sm" id="saveSmtp">保存</button>
+              <button class="btn btn--ghost btn--sm" id="testSmtp">发送测试</button>
+            </div>
+          </div>
+
+          <div class="card card--span2" id="aiCard">
+              <div class="ch-nav" data-type="ai"></div>
+            <div class="card-head card-head--slim"><span class="hint">接入大模型，让通知更简洁易读</span></div>
+            <div class="field field--inline">
+              <label class="switch">
+                <input type="checkbox" id="aiEnabled">
+                <span class="track"></span>
+                <span class="switch-text">启用 AI 通知优化</span>
+              </label>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label>接口地址（OpenAI 兼容）</label>
+                <input type="text" id="aiBaseUrl" placeholder="https://open.bigmodel.cn/api/paas/v4">
+              </div>
+              <div class="field field--narrow">
+                <label>AI 供应商</label>
+                <select id="aiProvider">
+                  <option value="">自定义</option>
+                  <option value="zhipu">智谱 GLM</option>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="siliconflow">硅基流动</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="moonshot">月之暗面 Kimi</option>
+                  <option value="qwen">阿里通义千问</option>
+                </select>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label>API Key</label>
+                <input type="text" id="aiApiKey" placeholder="sk-..." autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field field--narrow">
+                <label>模型</label>
+                <div class="field-row" style="flex-wrap:nowrap">
+                  <input type="text" id="aiModel" placeholder="glm-4-flash">
+                  <button class="btn btn--ghost btn--sm" id="aiFetchModels" style="flex:none;color:#1d9e75;font-weight:550">获取</button>
+                </div>
+              </div>
+            </div>
+            <div id="aiModelList" hidden></div>
+            <p class="field-note">选供应商会自动填好接口地址和推荐模型；Key 只存服务端，接口返回一律脱敏，原样点保存 = 不修改。</p>
+            <div class="field-row field-row--pair">
+              <div class="field">
+                <label>单次超时</label>
+                <select id="aiTimeout">
+                  <option value="10000">10 秒</option>
+                  <option value="15000">15 秒</option>
+                  <option value="20000">20 秒（推荐）</option>
+                  <option value="30000">30 秒</option>
+                  <option value="60000">60 秒</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>最多尝试</label>
+                <select id="aiMaxAttempts">
+                  <option value="1">1 次（不重试）</option>
+                  <option value="2">2 次（1 次重试，推荐）</option>
+                  <option value="3">3 次（2 次重试）</option>
+                </select>
+              </div>
+            </div>
+            <p class="field-note field-note--tight">首字出得慢的服务（要 5–8 秒才吐字的）用 20 秒起，别用 10 秒——第一次必超时、第二次才成功的多半就是这里太短。重试间隔固定 1.5 秒；总耗时上限 ≈ 超时 × 次数，调太大会让通知明显延迟。</p>
+            <div class="field">
+              <label>总提示语开头（所有任务共用）</label>
+              <textarea id="aiDefaultPrompt" rows="2" placeholder="例：提炼关键数字，一句话说清结果，去掉技术细节"></textarea>
+              <p class="field-note">这段属于「补充要求」：<strong>优先级低于任务里单独写的 AI 要求</strong>，只在任务没写到的地方生效。所以这里放所有通知都要遵守的共性要求（怎么排版、要不要给建议），具体口径 / 字段含义写进各自任务里更有效。</p>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn--primary btn--sm" id="saveAi">保存</button>
+              <button class="btn btn--ghost btn--sm" id="testAi">测试连接</button>
+            </div>
+            <p class="field-note">兼容 OpenAI 接口格式的服务均可。启用后，任务里填了「AI 通知优化要求」（哪怕只填一句）的通知会先经 AI 改写再发送，实际提示词是「上面的开头 + 任务里那句要求」。<strong>重试策略</strong>：按上面设的「单次超时 / 最多尝试」执行，每次重试前等 1.5 秒；全部失败则直接发原文，不会丢通知——通知结尾会标注状态：<code>✨ 已由 AI 优化</code> / <code>⚠ AI 优化未采用（原因），本次为原文</code>。</p>
+          </div>
+        </div>
+
+        <div class="set-sec">
+          <h3>数据与凭据</h3>
+          <p>任务执行时注入的变量、执行前自动续期的令牌，都只存服务端。</p>
+        </div>
+
+        <div class="grid-2 grid-2--even ch-grid">
+          <div class="card" id="envCard">
+            <div class="card-head"><h3>环境变量</h3><span class="hint">任务里写 {{变量名}}，执行时自动替换（仿青龙面板）</span></div>
+            <div class="env-table" id="envTable"></div>
+            <div class="env-add">
+              <input type="text" class="env-in env-in--key" id="envKey" placeholder="变量名，如 API_KEY" spellcheck="false">
+              <input type="text" class="env-in env-in--val" id="envVal" placeholder="变量值" autocomplete="off" spellcheck="false">
+              <input type="text" class="env-in env-in--note" id="envNote" placeholder="备注（可选）">
+              <button class="btn btn--ghost btn--sm" id="envAdd">+ 添加</button>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn--primary btn--sm" id="saveEnv">保存变量</button>
+            </div>
+            <p class="field-note">适用于所有 HTTP 任务的请求地址、请求头、请求体和每个步骤；<code>{{ACCESS_TOKEN}}</code> 仍由「凭据自动续期」专门管理。变量值只存服务端，页面上默认打码显示，点眼睛图标查看。</p>
+          </div>
+
+          <div class="card" id="tokenCard">
+            <div class="card-head"><h3>凭据自动续期</h3><span class="hint">任务里写 {{ACCESS_TOKEN}}，执行前自动换成有效令牌</span></div>
+            <div class="field">
+              <label>长效令牌 refreshToken</label>
+              <input type="text" id="tkRefresh" placeholder="粘贴 refreshToken" autocomplete="off" spellcheck="false">
+              <p class="field-note">accessToken 只活 30 天，这里只存长效令牌（60 天），每次任务执行前自动换新并回存，永不过期、无需手工替换。只存服务端，接口返回一律脱敏。</p>
+            </div>
+            <div class="field field--inline">
+              <label class="switch">
+                <input type="checkbox" id="tkEnabled">
+                <span class="track"></span>
+                <span class="switch-text">启用自动续期</span>
+              </label>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn--primary btn--sm" id="saveToken">保存并验证</button>
+              <button class="btn btn--ghost btn--sm" id="refreshTokenBtn">立即续期</button>
+            </div>
+            <div id="tkStatus" class="field-note" style="margin-top:10px"></div>
+          </div>
+        </div>
+
+        <div class="set-sec">
+          <h3>运行策略</h3>
+          <p>错过补跑的取舍、云端保活三道保险，以及后台日志入口。</p>
+        </div>
+
+        <div class="grid-2 grid-2--even">
+          <div class="card card--span2">
+            <div class="card-head"><h3>错过补跑</h3><span class="hint">服务休眠唤醒后，错过的定时任务怎么处理</span></div>
+            <div class="field">
+              <div class="chips" id="missedPolicy">
+                <label class="chip"><input type="radio" name="missedPolicy" value="run"><span>补跑一次</span></label>
+                <label class="chip"><input type="radio" name="missedPolicy" value="skip"><span>跳过并通知</span></label>
+              </div>
+              <p class="field-note">云端实例空闲时会休眠，被访问才唤醒，错过的任务唤醒后才被看到。<strong>补跑</strong>：晚点也执行一次，适合每日签到这类「晚跑总比不跑强」的任务；<strong>跳过</strong>：迟到超过 15 分钟就不执行，发一条站内说明，适合只在准点才有意义的任务。点击立即生效，无需保存。</p>
+            </div>
+          </div>
+
+          <div class="card" id="keepEntryCard">
+            <div class="card-head"><h3>长期运行</h3><span class="hint" id="keepEntryHint">—</span></div>
+            <!-- 运行概况直接摆数据，不用点进保活控制台才能看到 -->
+            <div class="srv-lines" id="keepRunLines"></div>
+            <div class="srv-lines" id="keepEntryLines"></div>
+            <div class="row-actions">
+              <button class="btn btn--primary btn--sm" data-goto="keep">打开保活控制台</button>
+            </div>
+            <p class="field-note">上半是连续运行统计（连续 / 累计 / 中断 / 内存），下半是三道保险状态。开关、参数与日志在保活控制台。</p>
+          </div>
+
+          <div class="card" id="logsEntryCard">
+            <div class="card-head"><h3>系统日志</h3><span class="hint" id="logsEntryHint">—</span></div>
+            <!-- 最近几条日志摘要：一眼看出最近有没有出问题 -->
+            <div class="srv-lines" id="logsEntryLines"></div>
+            <div class="row-actions">
+              <button class="btn btn--primary btn--sm" data-goto="logs">打开系统日志</button>
+            </div>
+            <p class="field-note">后台运行数据都在这里：启动时间、休眠/唤醒与中断空档、内存、接口与调度耗时、配置变更、异常堆栈。任务本身的执行结果在任务卡上的「日志」里看。</p>
+          </div>
+        </div>
+
+        <div class="set-sec">
+          <h3>安全与数据</h3>
+          <p>访问控制、管理员入口与数据导出。</p>
+        </div>
+
+        <div class="grid-2 grid-2--even">
+          <div class="card" id="authCard">
+            <div class="card-head"><h3>访问控制</h3><span class="hint" id="authModeHint">已关闭</span></div>
+            <div class="notice notice--info" id="authOpenNotice">
+              <strong>当前无需密码，打开链接即可进入</strong>
+              任何人拿到链接都能查看和修改任务。需要限制访问时，用 <code>REQUIRE_PASSWORD=1</code> 重新启动服务即可恢复密码登录。
+            </div>
+            <div class="notice notice--warn" id="authLockNotice" hidden>
+              <strong>访问控制已开启</strong>
+              主密码由服务端锁定，页面上无法修改。需要更换请调整环境变量 <code>FORCE_PASSWORD</code> 后重启服务。
+            </div>
+            <div class="row-actions">
+              <button class="btn btn--ghost btn--sm" id="adminEntryBtn">管理员入口</button>
+              <button class="btn btn--ghost btn--sm" id="logoutBtn" hidden>退出管理员</button>
+            </div>
+          </div>
+
+          <div class="card" id="dataCard">
+            <div class="card-head"><h3>数据管理</h3><span class="hint" id="dataEntryHint">—</span></div>
+            <div class="row-actions">
+              <button class="btn btn--ghost btn--sm" id="exportData">导出 JSON</button>
+            </div>
+            <p class="hint hint--block">数据保存在服务端 <code>data/state.json</code>，重启不丢。</p>
+          </div>
+        </div>
+
+        <!-- 只有 admin 身份登录后才会显示 -->
+        <div class="card" id="adminCard" hidden>
+          <div class="card-head">
+            <h3>管理面板</h3>
+            <span class="hint" id="adminWho">管理员</span>
+          </div>
+          <div class="admin-grid" id="adminStats"></div>
+          <div class="card-head card-head--tight">
+            <h3>登录尝试</h3>
+            <button class="btn btn--ghost btn--sm" id="adminUnlock">解除锁定</button>
+          </div>
+          <div class="audit-list" id="adminAudit"></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<!-- ============ 任务编辑器 ============ -->
+<div class="modal" id="taskLogModal" hidden>
+  <div class="modal-mask" data-tl-close></div>
+  <div class="modal-panel" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h3 id="tlTitle">任务运行日志</h3>
+      <button class="icon-btn" data-tl-close aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="tl-summary" id="tlSummary"></div>
+      <div class="tl-list" id="tlList"></div>
+    </div>
+    <div class="modal-foot">
+      <span class="hint" id="tlFootHint">执行记录保存在 state.json，最多保留最近若干条</span>
+      <button class="btn btn--ghost btn--sm btn--danger" id="tlClear">清空执行记录</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="smsPassModal" hidden>
+  <div class="modal-mask" data-sp-close></div>
+  <div class="modal-panel" role="dialog" aria-modal="true" style="max-width:420px">
+    <div class="modal-head">
+      <h3 id="spTitle">管理员登录</h3>
+      <button class="icon-btn" data-sp-close aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <p class="field-note" style="margin-top:0" id="spDesc">
+        短信通道的开关、保存、发送测试、链路诊断、重新授权、吊销以及日志查看，全部要求管理员权限。<br>
+        输入管理口令后，30 分钟内可执行上述操作；到期自动上锁，也可随时点「退出管理员」。
+      </p>
+      <div class="field">
+        <label>管理口令</label>
+        <input type="password" id="spInput" placeholder="管理员口令（不是短信通道密码）" autocomplete="current-password">
+      </div>
+      <p class="field-note" id="spErr" style="color:#c0392b;min-height:1.2em;margin-bottom:0"></p>
+    </div>
+    <div class="modal-foot">
+      <span class="hint">令牌只对 /api/sms 生效，30 分钟后自动失效 · 忘记口令可用 ADMIN_PASSWORDS 环境变量重设后重启</span>
+      <button class="btn btn--primary btn--sm" id="spOk">登录</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-mask" data-close></div>
+  <div class="modal-panel" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h3 id="modalTitle">新建任务</h3>
+      <button class="icon-btn" data-close aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="field"><label>任务名称</label><input type="text" id="fName" placeholder="例如：每日数据同步"></div>
+
+      <div class="field">
+        <label>任务组 <span class="label-hint">把相关的复杂任务归成一组，留空为不分组</span></label>
+        <input type="text" id="fGroup" list="groupOptions" maxlength="24" placeholder="例如：天气播报 / 每日签到">
+        <datalist id="groupOptions"></datalist>
+      </div>
+
+      <div class="field">
+        <label>场景模板 <span class="label-hint">一键填好整套配置，再改三处占位</span></label>
+        <div class="presets" id="scenePresets">
+          <button type="button" data-scene="weather">🌤 天气播报（和风）</button>
+        </div>
+        <p class="field-note" id="sceneNote" hidden></p>
+      </div>
+
+      <div class="field">
+        <label>任务类型</label>
+        <div class="type-picker" id="fType">
+          <button class="type-opt is-active" data-type="http">
+            <strong>HTTP 请求</strong>
+            <span>定时请求一个地址，适合自动打卡、接口保活</span>
+          </button>
+          <button class="type-opt" data-type="remind">
+            <strong>定时提醒</strong>
+            <span>在指定时间推送一条消息给你</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>执行节奏 <span class="label-hint">可以配多条，比如 09:00 一条、12:00 再来一条</span></label>
+        <div class="sched-list" id="fSchedules"></div>
+        <div class="row-actions">
+          <button class="btn btn--ghost btn--sm" type="button" id="addSched">＋ 添加节奏</button>
+        </div>
+        <div class="presets" id="cronPresets">
+          <button data-cron="0 9 * * *">每天 9:00</button>
+          <button data-cron="30 8 * * 1-5">工作日 8:30</button>
+          <button data-cron="0 */6 * * *">每 6 小时</button>
+          <button data-cron="0 9 * * 1">每周一 9:00</button>
+          <button data-cron="0 0 1 * *">每月 1 号</button>
+        </div>
+        <p class="field-note">快捷模板会填进「当前光标所在那一条」节奏。</p>
+        <p class="field-note">cron 按<b>服务器所在时区</b>解析（与浏览器本地时区、通知文案里的时间格式设置无关）；改动服务器时区后需重算下次执行时间。</p>
+      </div>
+
+      <div id="httpFields">
+        <div class="field-row">
+          <div class="field" style="max-width:112px;flex:none"><label>请求方法</label>
+            <select id="fMethod"><option>GET</option><option>POST</option><option>PUT</option><option>HEAD</option></select>
+          </div>
+          <div class="field"><label>请求地址</label><input type="text" id="fUrl" placeholder="https://example.com/api/checkin"></div>
+        </div>
+        <div class="field-row field-row--pair">
+          <div class="field"><label>期望状态码</label><input type="number" id="fExpect" value="200"></div>
+          <div class="field"><label>也算成功</label><input type="text" id="fAlsoOk" placeholder="400,409"></div>
+        </div>
+        <p class="field-note field-note--tight">响应码等于「期望」或列在「也算成功」里都算成功；留空即只看期望值。</p>
+        <div class="field-row field-row--pair">
+          <div class="field"><label>失败自动重试</label>
+            <select id="fRetryTimes">
+              <option value="0">不重试</option>
+              <option value="1">1 次</option>
+              <option value="2">2 次</option>
+              <option value="3">3 次</option>
+            </select>
+          </div>
+          <div class="field"><label>重试间隔</label>
+            <select id="fRetryDelay">
+              <option value="2000">2 秒</option>
+              <option value="3000">3 秒</option>
+              <option value="5000">5 秒</option>
+              <option value="10000">10 秒</option>
+            </select>
+          </div>
+        </div>
+        <p class="field-note field-note--tight">只对超时、连接失败、5xx、408/429 重试；401/403/404 直接判失败。签到、下单这类有副作用的请求建议保持「不重试」。</p>
+        <div class="field"><label>请求头 <span class="label-hint">JSON 格式，可留空</span></label>
+          <textarea id="fHeaders" rows="2" placeholder='{"Authorization":"Bearer xxx"}'></textarea>
+        </div>
+        <div class="field"><label>请求体 <span class="label-hint">POST/PUT 时使用</span></label>
+          <textarea id="fBody" rows="2" placeholder='{"action":"signin"}'></textarea>
+        </div>
+
+        <div class="field">
+          <label>多步骤 <span class="label-hint">按顺序串行执行，前一步失败则后续跳过</span></label>
+          <div class="steps" id="fSteps"></div>
+          <div class="row-actions">
+            <button class="btn btn--ghost btn--sm" type="button" id="addStep">+ 添加步骤</button>
+          </div>
+          <p class="field-note">留空则只发上面这一个请求。填了步骤后，以步骤为准依次执行（适合「先签到、再领奖励」这类链式动作）。</p>
+        </div>
+      </div>
+
+      <!--
+        保存/取消挪到这里：请求配置（含多步骤）填完就能直接存，
+        不用为了按保存键把长表单一路滚到底。下面剩的都是通知相关的可选项。
+      -->
+      <div class="modal-foot modal-foot--inline">
+        <span class="modal-err" id="modalErr"></span>
+        <div class="row-actions">
+          <button class="btn btn--ghost" data-close>取消</button>
+          <button class="btn btn--primary" id="modalSave">保存任务</button>
+        </div>
+      </div>
+
+      <div id="remindFields" hidden>
+        <div class="field"><label>提醒内容</label>
+          <textarea id="fMessage" rows="3" placeholder="到点了，该做这件事了。"></textarea>
+        </div>
+        <div class="field">
+          <label>推送通道</label>
+          <!-- 选项由 renderTaskChannelChips 现算：站内必选，其余只列已经配好的（含多账号实例） -->
+          <div class="chips" id="fChannels"></div>
+          <p class="field-note">站内通知必选、不可取消；其余只显示已经在「设置」里配好的渠道，没配的不会出现在这里。</p>        </div>
+      </div>
+
+      <label class="switch switch--block">
+        <input type="checkbox" id="fEnabled" checked>
+        <span class="track"></span>
+        <span class="switch-text">创建后立即启用</span>
+      </label>
+
+      <div class="notify-block">
+        <label class="switch switch--block">
+          <input type="checkbox" id="fNotify" checked>
+          <span class="track"></span>
+          <span class="switch-text">任务完成通知</span>
+        </label>
+        <div class="notify-opts" id="fNotifyOpts" hidden>
+          <div class="notify-when">
+            <span class="notify-label">通知时机</span>
+            <div class="chips" id="fNotifyWhen">
+              <label class="chip"><input type="checkbox" id="fNotifySuccess" checked><span>成功时</span></label>
+              <label class="chip"><input type="checkbox" id="fNotifyFailure" checked><span>失败时</span></label>
+            </div>
+          </div>
+          <div class="notify-when">
+            <span class="notify-label">通知渠道</span>
+            <div class="chips" id="fNotifyChannels"></div>
+          </div>
+          <p class="field-note">站内通知必选、不可取消；只列出已经配好的渠道，多账号会逐个显示（换行时看标识区分）。渠道名显示的是实际方案（NotifyMe / Bark / 飞书…），不是「Webhook」。各渠道在「通知」页点卡片可单独配置成功/失败时机。关闭本开关只影响这一个任务。</p>
+          <details class="nm-task" id="fNmBlock" hidden>
+            <summary>NotifyMe 推送选项<span class="nm-task-hint">勾了 NotifyMe 才需要看，留空即跟随设置页</span></summary>
+            <div class="nm-task-body">
+              <div class="field">
+                <label>大文本（通知栏展开多行）</label>
+                <select id="fNmBigText">
+                  <option value="">跟随设置页</option>
+                  <option value="1">展开</option>
+                  <option value="0">不展开</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>点击通知时</label>
+                <select id="fNmActionType">
+                  <option value="">跟随设置页</option>
+                  <option value="0">不动作</option>
+                  <option value="1">打开链接</option>
+                  <option value="2">打开应用</option>
+                  <option value="4">复制到剪贴板</option>
+                  <option value="5">提取验证码</option>
+                </select>
+              </div>
+              <div class="field" id="fNmActionField" hidden>
+                <label id="fNmActionLabel">链接地址</label>
+                <input type="text" id="fNmAction" placeholder="https://example.com" autocomplete="off" spellcheck="false">
+                <p class="field-note" id="fNmActionHint"></p>
+              </div>
+              <div class="field">
+                <label>通知分组（可选）</label>
+                <input type="text" id="fNmGroup" placeholder="留空跟随设置页" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field">
+                <label>紧急提醒</label>
+                <select id="fNmUrgent">
+                  <option value="">跟随设置页</option>
+                  <option value="1">开（持续响铃）</option>
+                  <option value="0">关</option>
+                </select>
+              </div>
+              <p class="field-note">这些只作用于本任务的手机推送，同一套设置页配置下别的任务不受影响。全部留空 = 完全跟随设置页。</p>
+            </div>
+          </details>
+          <div class="field">
+            <label>通知模版（可选）</label>
+            <textarea id="fNotifyTpl" rows="2" placeholder="留空用默认文案。支持变量：{{title}} {{body}} {{result}} {{status}} {{duration}} {{time}}"></textarea>
+          </div>
+          <div class="ai-block" id="fAiBlock">
+          <label class="switch switch--block ai-switch">
+            <input type="checkbox" id="fAiEnabled" checked>
+            <span class="track"></span>
+            <span class="switch-text">使用 AI 优化通知文案</span>
+          </label>
+          <p class="field-note" id="fAiHint">关闭后这个任务直接发接口原文，不调用 AI。</p>
+          <div class="ai-opts" id="fAiOpts">
+            <div class="field">
+              <label>本任务的 AI 要求（可选，优先于全局默认）</label>
+              <textarea id="fNotifyPrompt" rows="3" placeholder="例：只保留天气和降水概率，一句话播报，末尾加穿衣建议"></textarea>
+              <p class="field-note">这里写排版、口径、字段含义等硬要求；会作为最高优先级交给模型，和全局默认要求冲突时以这里为准。可机检的条款（每行 ≤N 字 / 正文 ≤N 字 / 每行 1 个 emoji / 不留空行 / 禁 markdown）会在生成后逐条检查，不达标自动纠正一次。</p>
+              <div class="ai-prompt-meta">
+                <span id="fAiPromptCount" class="ai-count">0 / 4000 字</span>
+                <button type="button" class="btn btn--ghost btn--sm" id="fAiPreviewBtn">看实际提示词</button>
+              </div>
+              <div class="ai-preview" id="fAiPreview" hidden></div>
+            </div>
+            <div class="field">
+              <label>用哪套 AI 配置</label>
+              <select id="fAiInstance"></select>
+              <p class="field-note">设置页「AI 通知优化」里新建的标签会出现在这里；不选就用默认那套。</p>
+            </div>
+          </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+<script src="/app.js" defer></script>
+</body>
+</html>
