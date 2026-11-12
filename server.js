@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-15';
+const SMS_BUILD = 'audit-batch-16';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -526,6 +526,21 @@ const DEFAULT_SETTINGS = {
    *   skip → cron 任务迟到超过 15 分钟就跳过本次，发一条站内说明
    */
   missedPolicy: 'run',
+  /*
+   * 服务中断后的补跑细则（第十六批之二）。
+   *
+   * 背景：云端实例会休眠，醒来时 nextRun 可能已经过去几小时。原实现是
+   * 「missedPolicy=run 就立刻跑」——8 个任务同一秒一起打出去，对上游是风控高风险，
+   * 而且如果那次其实已经跑过（只是没落下 nextRun），就是重复执行。
+   *
+   * 现在的口径是「补，但要克制」：
+   *   enabled        总开关（关掉就只推进 nextRun，不执行）
+   *   windowMinutes  只补这么久以内的错过；更久的视为已失效，只记日志
+   *   maxPerStart    一次启动最多补几个（其余丢弃并说明，避免启动风暴）
+   *   minGapSec      同任务两次执行的最小间隔（防「补跑 + 准点」连打上游）
+   *   jitterMaxMs    补跑前的随机等待上限（错峰，防同秒并发）
+   */
+  catchup: { enabled: true, windowMinutes: 120, maxPerStart: 5, minGapSec: 45, jitterMaxMs: 20000 },
   /*
    * 持续保活：开启后服务端每 intervalMin 分钟访问一次自己的公网探活地址，
    * 平台看到持续流量就不会让实例休眠 —— 任务永远准时，代价是实例常驻运行。
@@ -1935,14 +1950,19 @@ function maskNotifyMe(cfg) {
  * opts.admin 只影响唤醒令牌：它要复制给外部定时器用，非管理员没必要拿到。
  */
 /*
- * 凭据下发策略：**默认明文**。
+ * 凭据下发策略：**默认打码**（第十六批改的默认值）。
  *
- * 这里的凭据都是「泄露了也能接受损失」的低成本账号（FCM token、网关令牌、AI key），
- * 而掩码的真实成本是每天都要付的：输入框全空、改一个字段要先点眼睛输口令、
- * 复制令牌要再输一次口令。权衡下来默认摊开，想收紧时设 CRONHUB_CRED_MASK=1，
- * 退回「一律掩码 + 口令换明文」那一套（代码路径保留，随时可切）。
+ * 之前的默认是明文摊开，理由是「这些凭据泄露了也能接受损失」。但站点是开放模式，
+ * 链接一传出去，短信中继密钥、NotifyMe token、AI key 就直接出现在页面上；
+ * 截图、录屏、共享屏幕时的意外泄露成本远高于「点一下眼睛」的操作成本。
+ *
+ * 现在的取舍：
+ *   - /api/state 一律下发掩码，页面输入框留空 + 占位提示「已保存（已隐藏）」；
+ *   - 要看真值走「显示」按钮 → POST /api/settings/reveal（失败计数与登录共用防爆破）；
+ *   - 开放模式（没设管理口令）下 reveal 直接放行并记审计 —— 此时本来也没有口令可输；
+ *   - 需要回到过去的明文体验：设 CRONHUB_CRED_MASK=0 重启即可，代码路径保留。
  */
-const CRED_MASK = /^(1|true|yes|on)$/i.test(String(process.env.CRONHUB_CRED_MASK || ''));
+const CRED_MASK = !/^(0|false|no|off)$/i.test(String(process.env.CRONHUB_CRED_MASK || '1'));
 
 function maskSettings(st, opts) {
   const src = st && typeof st === 'object' ? st : {};
@@ -5060,6 +5080,296 @@ async function runTask(task, trigger) {
 
 let ticking = false;
 
+/* ---------------------------------------------------------- 错过补跑（可控） */
+
+/*
+ * 与 tick 的分工：
+ *   tick      负责「进程还活着时的迟到」—— 通常几秒到几分钟；
+ *   这里负责「进程整段不在的缺口」—— 重启、休眠唤醒、崩溃自愈之后。
+ *
+ * 站点存在的意义就是把任务跑成，所以默认要补（catchup.enabled 默认 true）。
+ * 但补跑必须有约束，否则会同时踩两个坑：
+ *   ① 重复执行 —— 签到/下单类任务多跑一次就是副作用多发生一次；
+ *   ② 服务方风控 —— 8 个任务在启动后同一秒一起打向同一个上游，形同攻击特征。
+ *
+ * 因此判据是「补得到 + 不重复 + 不扎堆」：
+ *   1) 错过 5 次也只补 1 次，不补齐 N 次（补跑不是追债）；
+ *   2) lastRun ≥ 错过时刻 → 那一次其实已经跑过，绝不补；
+ *   3) 距上次执行不足最小间隔 → 不补（防「补跑 + 准点」连打）；
+ *   4) 超出补跑窗口 → 不补，只推进 nextRun 并留痕；
+ *   5) 执行前先推进 nextRun 并落盘（认领），补跑中途被回收也不会再来一次；
+ *   6) 串行执行 + 随机抖动，同一时刻只有一条请求出去。
+ */
+
+// 等首轮预热/启动流程走完再动手；测试与排障可用 CRONHUB_CATCHUP_DELAY_MS 压到 0
+const CATCHUP_DELAY_RAW = String(process.env.CRONHUB_CATCHUP_DELAY_MS || '').trim();
+const CATCHUP_START_DELAY_MS = CATCHUP_DELAY_RAW && Number.isFinite(Number(CATCHUP_DELAY_RAW))
+  ? Math.max(0, Number(CATCHUP_DELAY_RAW))
+  : 12 * 1000;
+const CATCHUP_TOTAL_MS = 5 * 60 * 1000;     // 补跑总时长上限：再久就放弃剩余，交给正常调度
+
+const catchupQueue = [];
+const catchupRuntime = {
+  at: null,          // 最近一次规划时间
+  planned: 0,        // 本次启动计划补跑的数量
+  done: 0,
+  failed: 0,
+  skipped: 0,
+  reasons: [],       // [{ id, name, reason, label, lateMin }]
+  running: false,
+  stopped: false,
+  lastEndAt: null,
+  windowMinutes: 120,
+};
+
+function catchupPolicy() {
+  const c = (state.settings && state.settings.catchup) || {};
+  const num = (v, d, lo, hi) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d;
+  };
+  return {
+    enabled: c.enabled !== false,
+    windowMs: Math.round(num(c.windowMinutes, 120, 5, 1440)) * 60000,
+    maxPerStart: Math.round(num(c.maxPerStart, 5, 0, 50)),
+    minGapMs: Math.round(num(c.minGapSec, 45, 0, 3600)) * 1000,
+    jitterMaxMs: Math.round(num(c.jitterMaxMs, 20000, 0, 300000)),
+  };
+}
+
+function lastRunAtOf(task) {
+  const at = task && task.lastRun ? Date.parse(task.lastRun) : 0;
+  return Number.isFinite(at) ? at : 0;
+}
+
+/**
+ * 同任务最小间隔：取最短周期的 55%，再夹到策略上限。
+ * 1 分钟任务 → 33 秒，正常执行永远不会被误拦；
+ * 6 小时任务 → 45 秒（策略上限），足够让「补跑 + 准点」不在同一分钟内连打。
+ */
+function minGapFor(task, policy) {
+  const p = policy || catchupPolicy();
+  let period = Infinity;
+  for (const s of taskSchedules(task || {})) {
+    const ms = s.mode === 'interval'
+      ? Math.max(1, Number(s.everyMinutes) || 60) * 60000
+      : 60000; // cron 的最小粒度是 1 分钟
+    if (ms < period) period = ms;
+  }
+  if (!Number.isFinite(period)) return p.minGapMs;
+  return Math.min(p.minGapMs, Math.round(period * 0.55));
+}
+
+/**
+ * 启动补跑规划：算出「确实错过、且值得补」的任务，认领 nextRun，入队。
+ * 必须同步执行完（在 listen 之前），否则第一轮 tick 会先看到这些任务到期。
+ */
+function planCatchupOnBoot() {
+  const policy = catchupPolicy();
+  const now = Date.now();
+  catchupRuntime.at = nowISO();
+  catchupRuntime.windowMinutes = Math.round(policy.windowMs / 60000);
+  catchupRuntime.planned = 0;
+  catchupRuntime.done = 0;
+  catchupRuntime.failed = 0;
+  catchupRuntime.skipped = 0;
+  catchupRuntime.reasons = [];
+
+  const missed = [];
+  for (const t of state.tasks || []) {
+    if (!t || !t.enabled || !t.nextRun) continue;
+    const at = Date.parse(t.nextRun);
+    if (!Number.isFinite(at) || at > now) continue;
+    missed.push({ task: t, at });
+  }
+  if (!missed.length) return { planned: 0, missed: 0 };
+
+  missed.sort((a, b) => a.at - b.at); // 错过最久的优先补
+
+  const picked = [];
+  for (const item of missed) {
+    const t = item.task;
+    const late = now - item.at;
+    const last = lastRunAtOf(t);
+    const gap = minGapFor(t, policy);
+    const skip = (reason, label) => {
+      catchupRuntime.skipped += 1;
+      catchupRuntime.reasons.push({ id: t.id, name: t.name, reason, label, lateMin: Math.round(late / 60000) });
+    };
+    if (!policy.enabled) skip('off', '自动补跑已关闭');
+    else if ((t.config || {}).noCatchup === true) skip('task-off', '该任务单独关闭了补跑');
+    else if (late > policy.windowMs) skip('window', `错过 ${Math.round(late / 60000)} 分钟，超出 ${Math.round(policy.windowMs / 60000)} 分钟窗口`);
+    else if (last && last >= item.at) skip('already', '该时刻之后已成功执行过，不重复');
+    else if (last && now - last < gap) skip('gap', `距上次执行不足 ${Math.round(gap / 1000)} 秒，避免连打上游`);
+    else if (picked.length >= policy.maxPerStart) skip('limit', `超出单次上限 ${policy.maxPerStart} 个`);
+    else picked.push(item);
+  }
+
+  /*
+   * 无论补不补，nextRun 都必须推进到未来。
+   * 停在过去会让第一轮 tick 把它们当「刚到期的任务」直接跑掉，
+   * 那前面所有克制都白做了（这正是改造前的行为）。
+   */
+  for (const item of missed) {
+    const nx = computeNextRun(item.task, new Date(Math.max(now, item.at)));
+    item.task.nextRun = nx ? nx.toISOString() : null;
+  }
+
+  for (const item of picked) {
+    catchupQueue.push({ task: item.task, at: item.at, plannedAt: new Date(item.at).toISOString() });
+  }
+  catchupRuntime.planned = picked.length;
+  flushState();
+
+  const skipSummary = {};
+  for (const r of catchupRuntime.reasons) skipSummary[r.label] = (skipSummary[r.label] || 0) + 1;
+  const msg = `服务重启扫描：${missed.length} 个错过，补跑 ${picked.length} 个`
+    + (catchupRuntime.skipped ? `，跳过 ${catchupRuntime.skipped} 个（${Object.keys(skipSummary).join('；')}）` : '');
+  pushSysLog({
+    level: 'warn',
+    source: 'scheduler',
+    msg,
+    detail: {
+      missed: missed.length,
+      windowMinutes: catchupRuntime.windowMinutes,
+      planned: picked.map((x) => ({ id: x.task.id, name: x.task.name, plannedAt: new Date(x.at).toISOString() })),
+      skipped: catchupRuntime.reasons.slice(0, 20),
+    },
+  });
+
+  if (missed.length) {
+    const lines = [];
+    if (picked.length) {
+      lines.push(`将补跑 ${picked.length} 个（错峰、串行，最多 ${Math.round(policy.jitterMaxMs / 1000)} 秒抖动）：`);
+      lines.push(picked.map((x) => '· ' + x.task.name).join('\n'));
+    }
+    for (const [label, n] of Object.entries(skipSummary)) lines.push(`跳过 ${n} 个：${label}`);
+    pushNotification({
+      level: picked.length ? 'warn' : 'info',
+      title: picked.length ? `服务中断后补跑 ${picked.length} 个任务` : '错过的执行已跳过（不重复跑）',
+      body: lines.join('\n'),
+      source: 'scheduler',
+    });
+  }
+  return { planned: picked.length, missed: missed.length };
+}
+
+/**
+ * 串行执行补跑队列。
+ * 同一时刻只跑一个任务；每个任务前随机等一会儿。补跑期间 tick 会主动让路，
+ * 保证不会有第二条请求同时打向同一个上游。
+ */
+async function drainCatchupQueue() {
+  if (catchupRuntime.running) return 0;
+  if (!catchupQueue.length) return 0;
+  catchupRuntime.running = true;
+  const policy = catchupPolicy();
+  const deadline = Date.now() + CATCHUP_TOTAL_MS;
+  let ran = 0;
+  try {
+    while (catchupQueue.length && !catchupRuntime.stopped) {
+      if (Date.now() > deadline) {
+        const rest = catchupQueue.splice(0).map((x) => x.task.name);
+        pushSysLog({
+          level: 'warn',
+          source: 'scheduler',
+          msg: `补跑超过 ${Math.round(CATCHUP_TOTAL_MS / 60000)} 分钟上限，放弃剩余 ${rest.length} 个：${rest.join('、')}`,
+          detail: { rest },
+        });
+        break;
+      }
+      const item = catchupQueue.shift();
+      const t = item.task;
+      if (!t || !t.enabled) { catchupRuntime.skipped += 1; continue; }
+
+      // 排队期间可能已被「立即执行」跑过：宁可少跑一次，也不能多跑
+      const last = lastRunAtOf(t);
+      if (last && last >= item.at) {
+        catchupRuntime.skipped += 1;
+        catchupRuntime.reasons.push({ id: t.id, name: t.name, reason: 'queued-done', label: '排队期间已执行过', lateMin: 0 });
+        continue;
+      }
+
+      // 错峰：随机等待，避免多个任务在同一秒打向同一个上游
+      if (policy.jitterMaxMs > 0) {
+        const wait = Math.round(600 + Math.random() * Math.max(0, policy.jitterMaxMs - 600));
+        await sleepMs(wait);
+        const again = lastRunAtOf(t);
+        if (again && again >= item.at) { catchupRuntime.skipped += 1; continue; }
+        if (catchupRuntime.stopped) break;
+      }
+
+      pushSysLog({
+        level: 'info',
+        source: 'scheduler',
+        msg: `补跑「${t.name}」：原定 ${new Date(item.at).toLocaleString('zh-CN')}，已迟到 ${Math.round((Date.now() - item.at) / 60000)} 分钟`,
+        detail: { taskId: t.id, taskName: t.name, plannedAt: item.plannedAt },
+      });
+      try {
+        await runTaskGuarded(t, 'catchup');
+        ran += 1;
+        catchupRuntime.done += 1;
+      } catch (e) {
+        catchupRuntime.failed += 1;
+        pushSysLog({
+          level: 'error',
+          source: 'scheduler',
+          msg: `补跑「${t.name}」失败：${String((e && e.message) || e).slice(0, 160)}`,
+          detail: { taskId: t.id, taskName: t.name },
+        });
+      }
+
+      /*
+       * 补跑刚结束，如果下一次计划紧贴着来（< 最小间隔），往后顺延一次。
+       * 只错开这一次，不改长期节奏：nextRun 之后仍按 cron/锚点正常走。
+       */
+      const gap = minGapFor(t, policy);
+      const nextAt = t.nextRun ? Date.parse(t.nextRun) : 0;
+      if (gap > 0 && nextAt && nextAt - Date.now() < gap) {
+        const shifted = computeNextRun(t, new Date(Date.now() + gap));
+        if (shifted) {
+          t.nextRun = shifted.toISOString();
+          pushSysLog({
+            level: 'info',
+            source: 'scheduler',
+            msg: `「${t.name}」补跑后顺延下一次到 ${new Date(t.nextRun).toLocaleString('zh-CN')}（避免对上游连打）`,
+            detail: { taskId: t.id, minGapSec: Math.round(gap / 1000) },
+          });
+        }
+      }
+      saveState();
+    }
+  } finally {
+    catchupRuntime.running = false;
+    catchupRuntime.lastEndAt = nowISO();
+    if (ran) {
+      pushSysLog({
+        level: 'info',
+        source: 'scheduler',
+        msg: `补跑收尾：完成 ${catchupRuntime.done} 个，失败 ${catchupRuntime.failed} 个，跳过 ${catchupRuntime.skipped} 个`,
+        detail: { done: catchupRuntime.done, failed: catchupRuntime.failed, skipped: catchupRuntime.skipped },
+      });
+    }
+  }
+  return ran;
+}
+
+function catchupSnapshot() {
+  return {
+    enabled: catchupPolicy().enabled,
+    windowMinutes: catchupRuntime.windowMinutes,
+    planned: catchupRuntime.planned,
+    done: catchupRuntime.done,
+    failed: catchupRuntime.failed,
+    skipped: catchupRuntime.skipped,
+    queued: catchupQueue.length,
+    running: catchupRuntime.running,
+    at: catchupRuntime.at,
+    lastEndAt: catchupRuntime.lastEndAt,
+    reasons: catchupRuntime.reasons.slice(0, 8),
+  };
+}
+
 /*
  * ------------------------------------------------------------ 调度自我守护
  * ticking 是「同一时刻只有一个调度批在跑」的锁，但原实现只有一个 finally 释放它：
@@ -5169,6 +5479,13 @@ function maybePrewarm(now) {
 
 async function tick() {
   if (ticking) return 0;
+  /*
+   * 补跑队列在跑时主动让路。
+   * 补跑本身就是「串行 + 抖动」，如果这时 tick 又并发跑别的任务，
+   * 同一个上游会同时收到两条请求 —— 正是服务方风控最敏感的特征。
+   * 让路的代价是正常任务最多延后几分钟，只发生在服务刚重启的异常期。
+   */
+  if (catchupRuntime.running) return 0;
   ticking = true;
   tickStartedAt = Date.now();
   let ranCount = 0;
@@ -5223,6 +5540,44 @@ async function tick() {
           source: 'scheduler',
           msg: `跳过「${task.name}」：迟 ${Math.round(late / 60000)} 分钟，超过 ${Math.round(GRACE / 60000)} 分钟宽限（missedPolicy=skip）`,
           detail: { taskId: task.id, taskName: task.name, plannedAt: new Date(plannedAt).toISOString(), lateMs: late, policy: 'skip' },
+        });
+        saveState();
+        continue;
+      }
+      /*
+       * 补跑窗口上限：即使错过了 run 策略，迟到太久也不再执行。
+       * 进程卡了几小时后突然恢复，把每一次积压都补出去，对上游就是一整波集中请求；
+       * 「晚点跑总比不跑强」的前提是晚得不多，超过窗口就该交给下一次排期。
+       */
+      const cuPolicy = catchupPolicy();
+      if (late > cuPolicy.windowMs) {
+        pushNotification({
+          level: 'info',
+          title: '已放弃补跑：' + task.name,
+          body: `原定 ${new Date(plannedAt).toLocaleString('zh-CN')} 的执行已迟到 ${Math.round(late / 60000)} 分钟，超出 ${Math.round(cuPolicy.windowMs / 60000)} 分钟补跑窗口，本次不执行。下次：${task.nextRun ? new Date(task.nextRun).toLocaleString('zh-CN') : '未排期'}`,
+          source: 'scheduler',
+        });
+        pushSysLog({
+          level: 'warn',
+          source: 'scheduler',
+          msg: `放弃补跑「${task.name}」：迟 ${Math.round(late / 60000)} 分钟 > 窗口 ${Math.round(cuPolicy.windowMs / 60000)} 分钟`,
+          detail: { taskId: task.id, taskName: task.name, plannedAt: new Date(plannedAt).toISOString(), lateMs: late, windowMs: cuPolicy.windowMs },
+        });
+        saveState();
+        continue;
+      }
+      /*
+       * 最小间隔守卫：同一任务距上次执行太近，这一次就不再打出去。
+       * 典型是「启动补跑刚跑完，准点执行紧接着到点」——对签到类上游等于连打两下。
+       */
+      const cuGap = minGapFor(task, cuPolicy);
+      const cuLast = lastRunAtOf(task);
+      if (cuGap > 0 && cuLast && now - cuLast < cuGap) {
+        pushSysLog({
+          level: 'info',
+          source: 'scheduler',
+          msg: `跳过「${task.name}」本次：距上次执行仅 ${Math.round((now - cuLast) / 1000)} 秒，低于 ${Math.round(cuGap / 1000)} 秒下限`,
+          detail: { taskId: task.id, taskName: task.name, sinceLastMs: now - cuLast, minGapMs: cuGap },
         });
         saveState();
         continue;
@@ -5571,6 +5926,8 @@ function publicState(role) {
      * 在顶部挂一条警示 —— 数据被动过这么大的事，不该只留在系统日志里。
      */
     storage: stateStorageSnapshot(),
+    // 补跑状态（第十六批）：页面据此显示「本次启动补跑了几 个、跳过了哪些、为什么跳过」
+    catchup: catchupSnapshot(),
     meta: {
       now: nowISO(),
       timezone: process.env.TZ || state.settings.timezone || 'Asia/Shanghai',
@@ -5680,6 +6037,11 @@ function sanitizeNmPush(raw) {
    * state 里也不会凭空多出一批 true 字段。运行层 taskAiOn 用 !== false 判定。
    */
   if (c.aiEnabled === false) base.aiEnabled = false;
+  /*
+   * 任务级「不参与自动补跑」：只在显式关闭时落 true，老任务不受影响。
+   * 用于「一次都不能重复」的任务（下单、抽奖类）：宁可错过，也不重跑。
+   */
+  if (c.noCatchup === true) base.noCatchup = true;
   // 指定用哪个 AI 实例做优化（不填 = 用默认那套）
   const aiInst = String(c.aiInstance || '').trim();
   if (aiInst && CI_ID_RE.test(aiInst)) base.aiInstance = aiInst;
@@ -5776,6 +6138,8 @@ function sanitizeTask(input, existing) {
   if (type !== 'http') {
     const nmp = sanitizeNmPush(input.config && input.config.nmPush);
     if (nmp) config.nmPush = nmp;
+    // 提醒任务同样支持「不参与自动补跑」（http 分支在 sanitizeHttpConfig 里处理）
+    if (input.config && input.config.noCatchup === true) config.noCatchup = true;
   }
 
   // 单请求任务必须有 url；多步骤任务则要求 steps 里每步都有 url（由 sanitizeHttpConfig 校验）
@@ -5833,6 +6197,8 @@ async function handleApi(req, res, url) {
       stateWrites: stateWriteStats(),
       /* 落盘健康：fsync 是否生效、备份轮转时间、是否发生过损坏回退 —— 数据安全一眼可查 */
       storage: stateStorageSnapshot(),
+      /* 补跑：本次启动补成几个、跳过几个。跳过原因是「没重复跑」的证据，必须能看到 */
+      catchup: catchupSnapshot(),
       /*
        * 调度健康（第十七批）：ticking 卡住多久、被看门狗强制解开过几次。
        * 「任务不跑了」以前只能靠人发现，现在这一个对象就能看出来。
@@ -6627,6 +6993,26 @@ async function handleApi(req, res, url) {
       g.sni = sni || DEFAULT_SETTINGS.smsGatewaySni.sni;
       g.enabled = !!g.enabled && !!sni;
     }
+    /*
+     * 补跑参数一律夹到安全区间。
+     * 窗口给 0 会让「所有错过都算过期」，maxPerStart 不限又会退化成启动风暴，
+     * 两个方向都会让刚做好的保护失效。
+     */
+    if (next.catchup) {
+      const c = next.catchup;
+      const clampInt = (v, d, lo, hi) => {
+        const n = Math.round(Number(v));
+        return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d;
+      };
+      c.enabled = c.enabled !== false;
+      c.windowMinutes = clampInt(c.windowMinutes, 120, 5, 1440);
+      c.maxPerStart = clampInt(c.maxPerStart, 5, 0, 50);
+      c.minGapSec = clampInt(c.minGapSec, 45, 0, 3600);
+      c.jitterMaxMs = clampInt(c.jitterMaxMs, 20000, 0, 300000);
+    }
+    if (has('missedPolicy')) {
+      next.missedPolicy = next.missedPolicy === 'skip' ? 'skip' : 'run';
+    }
     // 短信通知：分级 / 字数 / 操作链接 / 退订与静音状态（页面与短信操作页都会改写这几个）
     if (next.sms) {
       next.sms.minLevel = next.sms.minLevel === 'all' ? 'all' : 'important';
@@ -6729,19 +7115,27 @@ async function handleApi(req, res, url) {
     }
     const body = await readBody(req);
     const password = String(body.password || '');
-    if (!password) return sendJSON(res, 400, { ok: false, error: '请输入管理口令' });
-    if (!adminPasswordMatch(password)) {
-      noteLoginFailure(ip);
-      pushAuthLog(req, { ok: false, role: 'reveal', ip });
-      pushSysLog({
-        level: 'warn',
-        source: 'config',
-        msg: '凭据明文查看失败：管理口令不正确',
-        detail: { action: 'settings.reveal', ok: false, ipTag: ipTagOf(ip) },
-      });
-      return sendJSON(res, 401, { ok: false, error: '管理口令不正确' });
+    /*
+     * 开放模式（站点没设管理口令）：没有口令可输，直接放行但记审计。
+     * 这不降低安全性 —— 开放模式本来就把整份状态摊在链接上；掩码在这里防的是
+     * 截图 / 录屏 / 共享屏幕时的意外泄露，不是防访问者。
+     */
+    const openMode = !REQUIRE_PASSWORD;
+    if (!openMode) {
+      if (!password) return sendJSON(res, 400, { ok: false, error: '请输入管理口令' });
+      if (!adminPasswordMatch(password)) {
+        noteLoginFailure(ip);
+        pushAuthLog(req, { ok: false, role: 'reveal', ip });
+        pushSysLog({
+          level: 'warn',
+          source: 'config',
+          msg: '凭据明文查看失败：管理口令不正确',
+          detail: { action: 'settings.reveal', ok: false, ipTag: ipTagOf(ip) },
+        });
+        return sendJSON(res, 401, { ok: false, error: '管理口令不正确' });
+      }
+      loginFailures.delete(ip);
     }
-    loginFailures.delete(ip);
     /*
      * 白名单取值器。envVars 是动态 key，单独按前缀匹配；
      * 其余都是固定路径，防止这里被当成「任意设置项读取器」。
@@ -6757,6 +7151,8 @@ async function handleApi(req, res, url) {
       'ai.apiKey': () => (state.settings.ai || {}).apiKey,
       'notifyme.token': () => (state.settings.notifyme || {}).token,
       'notifyme.uuid': () => (state.settings.notifyme || {}).uuid,
+      // 中继密钥：掩码后设置页也需要能看一眼（它是短信链路的唯一出口凭据）
+      'smsGatewayRelay.secret': () => (state.settings.smsGatewayRelay || {}).secret,
       'wake.token': () => ensureWakeToken(),
     };
     const readSecret = (key) => {
@@ -6782,8 +7178,8 @@ async function handleApi(req, res, url) {
       level: 'warn',
       source: 'config',
       // 只记「看了哪几项」，不记值、不记口令
-      msg: `凭据明文查看：${keys.join('、')}`,
-      detail: { action: 'settings.reveal', ok: true, keys, ipTag: ipTagOf(ip) },
+      msg: `凭据明文查看${openMode ? '（开放模式）' : ''}：${keys.join('、')}`,
+      detail: { action: 'settings.reveal', ok: true, keys, openMode, ipTag: ipTagOf(ip) },
     });
     return sendJSON(res, 200, { ok: true, values });
   }
@@ -8792,6 +9188,20 @@ bindings.ensure();
 })();
 
 /*
+ * 启动补跑（第十六批之二）。
+ *
+ * recoverInterruptedRuns 只负责把「执行到一半被回收」的痕迹收干净，它不补跑；
+ * 真正「错过的那些时刻」由这里处理。放在 listen 之前同步算完是必须的：
+ * 只要第一轮 tick 先跑，就会把这些 nextRun 在过去的任务当到期任务直接执行，
+ * 补跑的所有约束（窗口 / 去重 / 限速）就都没机会生效了。
+ */
+const bootCatchupPlan = planCatchupOnBoot();
+if (bootCatchupPlan.missed) {
+  console.log(`[scheduler] 补跑规划：错过 ${bootCatchupPlan.missed} 个，计划补跑 ${bootCatchupPlan.planned} 个`
+    + (catchupRuntime.skipped ? `，跳过 ${catchupRuntime.skipped} 个` : ''));
+}
+
+/*
  * 主密码强制锁定：每次启动都用 FORCED_PASSWORD 重算哈希。
  * 这样即使有人改了 state.json 或走了改密接口，重启后依然回到固定密码。
  */
@@ -8986,6 +9396,14 @@ server.listen(PORT, HOST, () => {
   console.log(`  时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
   console.log(`  访问控制：${REQUIRE_PASSWORD ? '已开启（需要密码登录）' : '已关闭（打开链接直接进入）'}`);
   console.log(`  管理入口：URL 加 ?admin 输入管理密码\n`);
+  /*
+   * 补跑延后十几秒动手：让连接预热、静态资源自检、首轮 tick 先走完。
+   * 服务刚起来的头几秒最脆弱，不适合同时承担任务执行。
+   */
+  if (catchupQueue.length) {
+    const t = setTimeout(() => { drainCatchupQueue().catch(() => {}); }, CATCHUP_START_DELAY_MS);
+    if (t && t.unref) t.unref();
+  }
 });
 
 /*
@@ -9000,6 +9418,12 @@ async function gracefulExit(signal) {
   const t0 = Date.now();
   console.log('\n[' + signal + '] 收到退出信号，开始收尾…');
   try { clearInterval(tickTimer); } catch { /* 未启动 */ }
+  // 补跑队列直接作废：正在跑的那一个由下面的 grace 等它收尾，排队中的不再开始
+  catchupRuntime.stopped = true;
+  const droppedByExit = catchupQueue.splice(0).length;
+  if (droppedByExit) {
+    console.log(`[exit] 补跑队列还有 ${droppedByExit} 个未开始，已放弃（下次启动会重新判定）`);
+  }
   const deadline = Date.now() + 5000;
   while (ticking && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));

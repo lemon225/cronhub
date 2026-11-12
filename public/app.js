@@ -121,8 +121,16 @@ function applySecretMode() {
  * 口令弹窗复用短信管理面那个（同一套交互），失败计数也在服务端统一算。
  */
 async function revealSecret(keys, hint) {
-  const pwd = await askSmsPassword(hint || '查看凭据需要管理口令');
-  if (!pwd) return null;
+  /*
+   * 开放模式（站点没设管理口令）没有口令可输，直接发空口令：
+   * 服务端在开放模式下放行并记审计。掩码在开放模式下依然有意义 ——
+   * 它防的是截图、录屏、共享屏幕时的意外泄露，不是防访问者。
+   */
+  let pwd = '';
+  if (authState && authState.passwordRequired) {
+    pwd = await askSmsPassword(hint || '查看凭据需要管理口令');
+    if (!pwd) return null;
+  }
   try {
     const r = await fetch('/api/settings/reveal', {
       method: 'POST',
@@ -1951,6 +1959,24 @@ function renderTaskChannelChips(remindChans, notifyChans) {
 function renderSettings() {
   const st = S.data.settings;
   applySecretMode();
+  /*
+   * 补跑状态每次渲染都刷（放在 hydrate 门控之外）：
+   * 它反映的是「本次启动补了几个、跳过几个」，会随队列推进变化，
+   * 塞进一次性 hydrate 里就会停在首帧，看着像一直没动静。
+   */
+  const cuState = S.data.catchup || {};
+  if ($('#cuLast')) {
+    if (!cuState.at) {
+      $('#cuLast').textContent = '本次启动还没有需要补跑的任务。';
+    } else if (cuState.running) {
+      $('#cuLast').textContent = `正在补跑：已完成 ${cuState.done || 0} 个，队列还剩 ${cuState.queued || 0} 个。`;
+    } else {
+      const why = (cuState.reasons || []).slice(0, 2).map((r) => `${r.name}：${r.label}`).join('；');
+      $('#cuLast').textContent = `上次启动：计划补跑 ${cuState.planned || 0} 个，完成 ${cuState.done || 0}，失败 ${cuState.failed || 0}，跳过 ${cuState.skipped || 0}`
+        + (why ? `（${why}${(cuState.reasons || []).length > 2 ? ' 等' : ''}）` : '')
+        + `。${cuState.at ? '时间 ' + new Date(cuState.at).toLocaleString('zh-CN') : ''}`;
+    }
+  }
   if (!smtpHydrated) {
     // 四个通知渠道按「当前激活的标签」回显（默认标签 = 老的单套配置）
     renderChannelTabs();
@@ -1962,6 +1988,15 @@ function renderSettings() {
     // 错过补跑策略回显
     const mp = (st.missedPolicy === 'skip') ? 'skip' : 'run';
     $$('#missedPolicy input').forEach((i) => { i.checked = i.value === mp; });
+
+    // 补跑细则回显：全部带兜底值，state 里缺字段（老数据）也不会把输入框清成空
+    const cu = st.catchup || {};
+    const numOr = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+    if ($('#cuEnabled')) $('#cuEnabled').checked = cu.enabled !== false;
+    if ($('#cuWindow')) $('#cuWindow').value = numOr(cu.windowMinutes, 120);
+    if ($('#cuMax')) $('#cuMax').value = numOr(cu.maxPerStart, 5);
+    if ($('#cuMinGap')) $('#cuMinGap').value = numOr(cu.minGapSec, 45);
+    if ($('#cuJitter')) $('#cuJitter').value = Math.round(numOr(cu.jitterMaxMs, 20000) / 1000);
 
     /*
      * 短信网关 / 中转页面已下线（导航入口与整页都已移除），回显前先确认控件还在。
@@ -2961,6 +2996,8 @@ function openModal(task) {
   if (pv) { pv.hidden = true; pv.innerHTML = ''; }   // 换任务时别把上一条的预览留着
   // 老任务没存过 aiEnabled 视为开启，与后端 taskAiOn 的判定保持一致
   if ($('#fAiEnabled')) $('#fAiEnabled').checked = c.aiEnabled !== false;
+  // 补跑开关：只有显式存过 true 才勾上，老任务默认「允许补跑」
+  if ($('#fNoCatchup')) $('#fNoCatchup').checked = c.noCatchup === true;
   if ($('#fAiInstance')) {
     const opts = ['<option value="">默认（设置页那套）</option>'].concat(
       channelInstancesOf('ai').map((i) => `<option value="${esc(i.id)}">${esc(i.remark || i.id.slice(-4))}${i.enabled === false ? '（未启用）' : ''}</option>`)
@@ -3596,6 +3633,12 @@ async function saveTask() {
     const aiInst = ($('#fAiInstance') && $('#fAiInstance').value) || '';
     if (aiInst) config.aiInstance = aiInst;
   }
+  /*
+   * 任务级补跑开关：只在勾上时写 true，取消勾选写 false ——
+   * 后端两处 sanitize 都只认 true，所以 false 会被丢掉，等于恢复默认「允许补跑」。
+   */
+  const noCatch = $('#fNoCatchup');
+  if (noCatch) config.noCatchup = !!noCatch.checked;
 
   const payload = {
     name,
@@ -5936,6 +5979,24 @@ function bind() {
         i.value === 'skip' ? '已切换：错过的任务将跳过并通知' : '已切换：错过的任务将补跑一次'
       );
       if (!okSaved) await load(); // 失败时回读真实状态，避免界面与服务端不一致
+    });
+  });
+
+  /* ---- 补跑细则：改了即存，不必再点保存 ---- */
+  $$('#catchupOpts input').forEach((el) => {
+    el.addEventListener('change', async () => {
+      const numOr = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+      const okSaved = await saveSettings({
+        catchup: {
+          enabled: $('#cuEnabled').checked,
+          windowMinutes: numOr($('#cuWindow').value, 120),
+          maxPerStart: numOr($('#cuMax').value, 5),
+          minGapSec: numOr($('#cuMinGap').value, 45),
+          // 页面按秒填，后端按毫秒存
+          jitterMaxMs: Math.round(numOr($('#cuJitter').value, 20) * 1000),
+        },
+      }, '补跑设置已保存');
+      if (!okSaved) await load();
     });
   });
 
