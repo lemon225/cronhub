@@ -6,7 +6,53 @@
 
 ---
 
-## 2026-11-13 · 第十九批 · `audit-batch-19` · 修 gzip 响应被误判为「连接已关闭」（回归）
+## 2026-11-14 · 第二十批 · `audit-batch-20` · 陪护判据解耦 + 发送超时对齐 + 体检端点收口（批次 A 止血）
+
+**背景**：当天的 CronHub × Cloudflare 协同审查给出四个 P0，全是「链路其实通着，但判定把它说成挂了」。
+线上实测基线：中继探针 `ok:true` 但 `10665ms`（connect 336 / tls 179 / **ttfb 12273**），
+陪护体检 `ok:false`、`siteOk:false`（`The operation was aborted`），`relay.ok=true` 与 `upCount=0` 同时出现。
+
+### ① 陪护判据解耦：通道健康只看上游腿（`relay/_worker.js` → relay-v4）
+
+- `/__guard` 的 `ok` / HTTP 码改为**只由上游腿决定**，站点腿降级为参考项，单列 `siteOk` + `verdict`
+  （`ok` / `channel-ok-site-slow` / `upstream-down`）
+- 原因：站点腿是「CF 边缘 → 国内实例」，冷启动常越过 12s 被自己 abort；把它算进 `ok`，
+  就会得出「上游 403 正常、短信刚发成功，却报中继异常」——`failStreak` 到 2 就推手机假警报
+- `SITE_TIMEOUT_MS` 默认 12s → 20s；本站侧 `guardOnce` 超时 25s → 32s（必须比中继那层长，否则先把自己 abort）
+- 站点侧：`relayGuard.ok` 与告警都改按上游判定；站点腿由「通」转「慢」只写一条 info 日志，不再 warn
+
+### ② 指标口径统一
+
+- `relayHealth.ms` 统一取**整轮体检耗时**，上游那一段单列进 `timing.upstreamMs`（以前是上游 ms、整轮 ms 混用）
+- `upCount` 改按「有没有回 JSON」统计 —— 中继回 502 也是可达，不该算成「不通 0 条」
+
+### ③ 发送超时父子对齐（`server.js` + `lib/sms/send.cjs`）
+
+- 父进程 `execTimeout` 自动 30s → 45s、手动 20s → 40s；子进程通过 `CRONHUB_SMS_BUDGET_MS` 拿到「总预算 −5s」
+- 子进程每次尝试的超时按剩余预算收缩（上限 30s），预算见底就停 —— 以前「父 30s vs 子 30s」，
+  第二次重试必然被 kill，重试等于没有
+- **重复短信防线**：已建连后才超时（`connectMs > 0`）→ 判为「可能已被网关受理」，既不换中继也不再重试；
+  只有连接阶段就失败（端口拒绝 / DNS）才继续重试。从严取舍：宁可任务判失败下轮补，也不发两条一样的
+- 手动路径 40s 仍在前端 90s 等待窗口内
+
+### ④ `/api/relay/guard` 收口
+
+- 60 秒结果缓存，`?force=1` 强制重测（设置页按钮走 force）
+- 开着访问控制（`REQUIRE_PASSWORD=1`）时要求登录，未登录 401
+- 以前无鉴权、无缓存：任何人拿到 sharecode 就能反复触发十几秒的出站探测
+
+**验证**（`npm test` 8 个用例文件全通，新增 3 个）：
+
+| 用例 | 覆盖 |
+|---|---|
+| `tests/relay-guard.test.cjs` | 上游通 + 站点 abort → 200/`channel-ok-site-slow`；上游断 → 502/`upstream-down`；无密钥 403；header 密钥可用 |
+| `tests/sms-budget.test.cjs` | 「接了 TCP 不回 TLS」造出已建连超时 → 只跑 1 次尝试并打 `[停止]`；端口拒绝 → 仍重试到第 2 次 |
+| `tests/relay-api.test.cjs` | 鉴权模式下未登录 401；开放模式 + 未配中继 → 200 且 `configured:false` |
+
+**未做（批次 B/C，待定）**：密钥内联改环境变量并轮换、`x-relay-upstream-ms` 接进站点侧、两份中继源码合一、
+第二条中继、CF Rate Limiting。**密钥仍是旧的 `cronhub:dcb1470e…`，仍硬编码在两份源码里。**
+
+---
 
 **现象**：天气播报任务连续 3 次失败，报「[实况] 失败：请求失败：响应未读完连接已关闭」。
 同一时间用 curl 直连同一个 URL 是正常的，任务配置、密钥、网络都没变。

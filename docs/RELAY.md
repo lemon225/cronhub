@@ -90,7 +90,7 @@ CronHub 的短信**只能**经 Cloudflare Pages 中继发出；网站与 Cloudfl
 |---|---|---|---|
 | `GET /__status` | 版本 / 配置态 / 超时参数 / 端点清单，不含密钥 | 200 | 403 鉴权失败 |
 | `GET /__probe` | 只测「CF → 网关」TLS，不发业务请求 | 200 `{ok:true,status:403}` | 502 `{ok:false,errorKind}` |
-| `GET /__guard` | **双向陪护**：并行测上游 + 回探站点健康 | 200 `ok:true` | 502 `ok:false` |
+| `GET /__guard` | **双向陪护**：并行测上游 + 回探站点健康（**200/502 只看上游腿**） | 200 `ok:true` | 502 `ok:false` |
 | `GET /__echo` | 回显 CF 眼中的调用方（IP / ASN / 组织 / TLS） | 200 | — |
 | `GET /__wake` | 从 CF 边缘打一次 `/api/wake`（会触发一次 tick） | 200 `ok:true` | 502 |
 | 其它路径 | 原样转发给白名单上游 | 透传上游状态码 | 502 网络错 / 504 超时 |
@@ -101,13 +101,27 @@ CronHub 的短信**只能**经 Cloudflare Pages 中继发出；网站与 Cloudfl
 
 ```json
 {
-  "ok": true, "ver": "relay-v2", "edge": "SJC", "user": "cronhub",
+  "ok": true, "channelOk": true, "siteOk": false, "ver": "relay-v4", "edge": "SJC", "user": "cronhub",
+  "verdict": "channel-ok-site-slow",
   "upstream": { "ok": true, "host": "5gvas01.cmicmaap.com", "status": 403, "ms": 169 },
-  "site": { "ok": true, "status": 200, "ms": 2128, "build": "audit-batch-9",
-            "relay": { "ok": true, "src": "guard" }, "wake": { "count": 123 } },
-  "hint": "两侧均正常：网站可经中继发短信，中继可回探网站健康"
+  "site": { "ok": false, "status": 0, "ms": 20001, "error": "The operation was aborted", "kind": "timeout" },
+  "hint": "短信通道正常（上游通）；站点回探偏慢，仅作参考，不影响通道健康"
 }
 ```
+
+**第二十批判据变更（重要）**：`ok` 与 HTTP 状态码**只由上游腿决定**。
+站点腿（CF 边缘 → 国内实例）测的是「中继能否回探本站」，冷启动常越过 `SITE_TIMEOUT_MS`；
+把它一起算进 `ok`，会出现「上游明明通、短信明明能发，整条体检却回 502」的**假警报**
+（2026-11-14 线上实测：`upstream.ok=true`、`site` 被 abort、`failStreak` 已累积到 1）。
+现在站点腿降级为参考项，单列 `siteOk` 与 `verdict`：
+
+| `verdict` | 含义 | HTTP | 是否告警 |
+|---|---|---|---|
+| `ok` | 两侧均通 | 200 | 否 |
+| `channel-ok-site-slow` | 上游通、站点回探偏慢 | 200 | 否（只写一条 info 日志） |
+| `upstream-down` | 上游不通，短信发不出去 | 502 | 是 |
+
+`SITE_TIMEOUT_MS` 默认同步放宽到 20s（可用变量覆盖）。
 
 ---
 
@@ -146,7 +160,9 @@ CronHub 的短信**只能**经 Cloudflare Pages 中继发出；网站与 Cloudfl
 
 设置页「服务器」卡下方新增一张**默认折叠**的「网站 ↔ Cloudflare 双向陪护」卡：卡头一行给总体结论与状态点，展开显示四项指标（上游网关 / 本站回探 / 最近体检 / CF 唤醒）和「立即体检」按钮。
 
-- 按钮调 `GET /api/relay/guard`，只读、不发短信、不触发调度；内部两侧并行，服务端 25s 超时，客户端留 40s。
+- 按钮调 `GET /api/relay/guard?force=1`，只读、不发短信、不触发调度；内部两侧并行，中继侧站点腿 20s、本站 32s 超时，客户端留 40s。
+- **60 秒结果缓存**：同一轮体检十几秒的出站占用，手动连点或外部轮询不必每次真跑；`?force=1` 才强制重测（按钮走这条）。
+- **鉴权**：开着访问控制（`REQUIRE_PASSWORD=1`）时要求登录，未登录回 401 —— 以前这个端点任何人都能调，等于给了一个免费的十几秒出站放大器。
 - 四态：未配置 / 等待首次体检 / 双向正常 / 体检异常。上游失败原因单独显示，不与「本站回探」结果混用。
 - **403 是网关对探针的正常响应**，界面标注「探针预期」；判断是否连通看 `ok`，不要看状态码。
 - 用原生 `<details>` 保持开合态，`renderCompanion()` 只写 `textContent` 不重建 DOM，因此 45 秒轮询和任务编辑门控都不会把用户展开的卡收回去。

@@ -3851,13 +3851,20 @@ function renderCompanion() {
   const g = c.guard || {};
   const r = c.relay || {};
   const w = c.wake || {};
-  const allOk = g.ok === true && g.upstreamOk === true && g.siteOk === true;
-  const level = allOk ? 'ok' : (g.ok === false ? 'err' : 'warn');
-  if (dot) dot.className = 'sdot is-' + (allOk ? 'ok' : (g.ok === false ? 'err' : 'off'));
+  /*
+   * 通道健康只看上游腿（与后端一致）：短信发不发得出去，由「CF → 网关」决定。
+   * 站点腿（CF → 本站）冷启动常十几秒，把它算进红绿会把「能发短信」误标成异常。
+   */
+  const channelOk = g.ok === true;
+  const siteOk = g.siteOk === true;
+  const level = channelOk ? 'ok' : (g.ok === false ? 'err' : 'warn');
+  if (dot) dot.className = 'sdot is-' + (channelOk ? 'ok' : (g.ok === false ? 'err' : 'off'));
 
   let brief;
-  if (allOk) brief = '双向正常 · ' + (g.at ? fmtAgo(g.at) : '刚刚');
-  else if (g.ok === false) brief = '体检异常 · ' + (g.error || '一侧不通');
+  if (channelOk) {
+    brief = (siteOk ? '双向正常' : '短信通道正常 · 站点回探偏慢')
+      + ' · ' + (g.at ? fmtAgo(g.at) : '刚刚');
+  } else if (g.ok === false) brief = '体检异常 · ' + (g.error || '上游不通');
   else brief = '等待首次体检';
   set('#cmpBrief', brief, 'hint' + (level === 'err' ? ' hint--warn' : ''));
 
@@ -3872,12 +3879,11 @@ function renderCompanion() {
     r.ok === false && r.error ? '原因 ' + r.error : '',
   ].filter(Boolean).join(' · ') || '暂无探针数据');
 
-  const siteOk = g.siteOk === true;
-  set('#cmpSite', g.ok == null ? '未知' : (siteOk ? '可达' : '不可达'),
-    'cmp-v is-' + (siteOk ? 'ok' : (g.ok === false ? 'err' : 'warn')));
-  // g.error 是整条体检的失败原因，不等于「本站回探」的结果，别混在一起显示
+  set('#cmpSite', g.ok == null ? '未知' : (siteOk ? '可达' : '偏慢'),
+    'cmp-v is-' + (siteOk ? 'ok' : 'warn'));
+  // 站点腿是参考项：它慢不等于短信发不出去，这里不再跟着整条体检的失败状态染红
   set('#cmpSiteNote', g.build ? '回探到 build ' + g.build
-    : (g.ok === false ? '未取得回探结果' : '中继尚未回探本站'));
+    : (siteOk ? '' : '回探未通过 · 不影响短信通道'));
 
   set('#cmpAt', g.at ? fmtAgo(g.at) : '尚未体检', 'cmp-v');
   set('#cmpAtNote', [
@@ -3897,13 +3903,14 @@ if ($('#cmpGuardBtn')) {
     const old = btn.textContent;
     btn.disabled = true;
     btn.textContent = '体检中…';
-    if (note) note.textContent = '正在并行检测上游网关与本站，最多 25 秒…';
+    if (note) note.textContent = '正在并行检测上游网关与本站，最多 30 秒…';
     try {
-      // /__guard 内部两侧并行，服务端 25s 超时，客户端留足余量
-      const r = await api('/api/relay/guard', { timeout: 40000 });
+      // force=1：按钮就是要「现在测一次」，绕过服务端 60 秒结果缓存；客户端留足余量
+      const r = await api('/api/relay/guard?force=1', { timeout: 40000 });
       if (note) {
         note.textContent = r.ok
-          ? '体检通过：两侧均通（' + (r.ms || 0) + 'ms），状态已更新。'
+          ? '体检通过：短信通道正常（' + (r.ms || 0) + 'ms）'
+            + (r.siteOk === false ? '，站点回探偏慢（参考项）' : '，两侧均通') + '，状态已更新。'
           : '体检未通过：' + (r.error || ('HTTP ' + r.status)) + '。详情见上方四项。';
       }
       await load();

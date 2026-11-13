@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-19';
+const SMS_BUILD = 'audit-batch-20';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2336,7 +2336,7 @@ async function probeSmsRelay() {
  * 只在状态由「通」转「不通」时写一条系统日志，避免每小时刷屏。
  * 注意：这里绝不能改打 /api/wake —— 那会触发 tick，而 tick 又可能再打 /__guard。
  */
-const relayGuard = { at: null, ok: null, ms: 0, upstreamOk: null, siteOk: null, build: '', edge: '', error: '', lastOk: undefined, via: '', timing: null, tried: [] };
+const relayGuard = { at: null, ok: null, ms: 0, status: 0, upstreamOk: null, siteOk: null, build: '', edge: '', error: '', lastOk: undefined, via: '', timing: null, tried: [], cached: false };
 let relayGuardRunning = false;
 /*
  * 连续失败计数。中继是短信的唯一出口，它挂了短信就是全静默失败，
@@ -2383,7 +2383,12 @@ async function guardOnce(ep, headers) {
   const timing = {};
   const t0 = Date.now();
   try {
-    const rr = await httpClient.request(new URL('/__guard', ep).toString(), { headers, timeoutMs: 25000, timing });
+    /*
+     * 超时给到 32s：中继的站点腿（CF 边缘 → 国内实例）冷启动可能要十几秒，
+     * 中继侧 SITE_TIMEOUT 已放宽到 20s，本站这一层必须比它长，否则先把自己 abort 了
+     * —— 那就是之前「陪护恒定失败」的另一半原因（The operation was aborted）。
+     */
+    const rr = await httpClient.request(new URL('/__guard', ep).toString(), { headers, timeoutMs: 32000, timing });
     const txt = await rr.text();
     let parsed = null;
     try { parsed = JSON.parse(txt); } catch { /* 非 JSON 忽略 */ }
@@ -2393,11 +2398,23 @@ async function guardOnce(ep, headers) {
   }
 }
 
-async function guardSmsRelay() {
+/** 体检结果缓存窗口：手动连点 / 外部轮询不必每次都真跑一轮十几秒的出站 */
+const RELAY_GUARD_CACHE_MS = 60000;
+async function guardSmsRelay(opt) {
+  const force = !!(opt && opt.force);
   const cfg = state.settings.smsGatewayRelay || {};
   const eps = relayEndpoints(cfg);
   if (!eps.length) return { configured: false, ok: null, note: '未配置短信中继' };
   if (relayGuardRunning) return { configured: true, busy: true, ok: relayGuard.ok, at: relayGuard.at };
+  const lastAt = relayGuard.at ? Date.parse(relayGuard.at) : 0;
+  if (!force && lastAt && Date.now() - lastAt < RELAY_GUARD_CACHE_MS) {
+    return {
+      configured: true, cached: true, cacheAgeMs: Date.now() - lastAt,
+      ok: relayGuard.ok, status: Number(relayGuard.status) || 0, ms: relayGuard.ms,
+      upstreamOk: relayGuard.upstreamOk, siteOk: relayGuard.siteOk,
+      via: relayGuard.via, error: relayGuard.error, at: relayGuard.at,
+    };
+  }
   relayGuardRunning = true;
   const headers = cfg.secret ? { 'X-Relay-Secret': String(cfg.secret) } : {};
   const g0 = Date.now();
@@ -2410,7 +2427,7 @@ async function guardSmsRelay() {
     let hit = null;
     for (const ep of eps) {
       const r = await guardOnce(ep, headers);
-      tried.push({ url: r.url, ok: r.ok, status: r.status, ms: r.ms, ...(r.error ? { error: r.error } : {}) });
+      tried.push({ url: r.url, ok: r.ok, responded: !!(r.parsed && typeof r.parsed === 'object'), status: r.status, ms: r.ms, ...(r.error ? { error: r.error } : {}) });
       if (r.parsed && typeof r.parsed === 'object') { hit = r; break; }
     }
     const ms = Date.now() - g0;
@@ -2418,7 +2435,7 @@ async function guardSmsRelay() {
       const msg = String((tried[0] && tried[0].error) || '所有中继地址均不可达');
       noteRelayHealth({ ok: false, ms, status: 0, src: 'guard', edge: '', via: '', timing: null, error: msg, endpoints: eps.length, upCount: 0 });
       const prev = relayGuard.lastOk;
-      Object.assign(relayGuard, { at: nowISO(), ok: false, ms, upstreamOk: false, siteOk: false, edge: '', error: msg, lastOk: false, via: '', timing: null, tried });
+      Object.assign(relayGuard, { at: nowISO(), ok: false, ms, status: 0, upstreamOk: false, siteOk: false, edge: '', error: msg, lastOk: false, via: '', timing: null, tried });
       if (prev === true) {
         pushSysLog({ level: 'warn', source: 'relay', msg: `双向陪护体检请求失败：${msg}`, detail: { ms, tried } });
       }
@@ -2429,37 +2446,57 @@ async function guardSmsRelay() {
     const parsed = hit.parsed;
     const upstreamOk = !!(parsed && parsed.upstream && parsed.upstream.ok);
     const siteOk = !!(parsed && parsed.site && parsed.site.ok);
-    const err = upstreamOk ? '' : String((parsed && parsed.upstream && parsed.upstream.error) || '上游探针失败');
+    /*
+     * 通道健康只看上游腿（CF → 短信网关）。站点腿是「中继能否回探本站」，
+     * 走的是 CF 边缘 → 国内实例，冷启动常越过超时；把它算进健康判定会得出
+     * 「上游通、短信能发，却报中继异常」的假警报（2026-11-14 实测：upstream ok、
+     * site aborted，failStreak 已累积）。所以 siteOk 只留作参考，不参与告警。
+     */
+    const channelOk = upstreamOk;
+    const upstreamMs = Number(parsed && parsed.upstream && parsed.upstream.ms) || 0;
+    const timing = { ...(hit.timing || {}), ...(upstreamMs ? { upstreamMs } : {}) };
+    // 可达中继条数按「有没有回 JSON」算：回 502 也是可达，只是上游不通
+    const reachable = tried.filter((x) => x.responded).length;
+    const err = channelOk ? '' : String((parsed && parsed.upstream && parsed.upstream.error) || '上游探针失败');
     noteRelayHealth({
-      ok: upstreamOk,
-      ms: (parsed && parsed.upstream && parsed.upstream.ms) || hit.ms,
+      ok: channelOk,
+      // ms 统一取整轮体检耗时，上游那一段单列进 timing.upstreamMs —— 三个口径不再打架
+      ms,
       status: (parsed && parsed.upstream && parsed.upstream.status) || 0,
       src: 'guard', edge: (parsed && parsed.edge) || '', error: err,
-      via: hit.url, timing: hit.timing, endpoints: eps.length, upCount: eps.length - tried.filter((x) => !x.ok).length,
+      via: hit.url, timing, endpoints: eps.length, upCount: reachable,
     });
     const prev = relayGuard.lastOk;
+    const prevSite = relayGuard.siteOk;
     Object.assign(relayGuard, {
-      at: nowISO(), ok: hit.ok, ms, upstreamOk, siteOk,
+      at: nowISO(), ok: channelOk, ms, status: hit.status, upstreamOk, siteOk,
       build: (parsed && parsed.site && parsed.site.build) || '',
       edge: (parsed && parsed.edge) || '',
-      error: hit.ok ? '' : (err || String((parsed && parsed.site && parsed.site.error) || `HTTP ${hit.status}`)),
-      lastOk: hit.ok, via: hit.url, timing: hit.timing, tried,
+      error: channelOk ? '' : (err || `HTTP ${hit.status}`),
+      lastOk: channelOk, via: hit.url, timing, tried,
     });
-    if (prev === true && !hit.ok) {
+    if (prev === true && !channelOk) {
       pushSysLog({
         level: 'warn', source: 'relay',
-        msg: `双向陪护体检失败：上游${upstreamOk ? '正常' : '不通'} / 站点${siteOk ? '正常' : '不通'}（HTTP ${hit.status}，${ms}ms，经 ${hit.url}）`,
+        msg: `短信中继上游不通：${relayGuard.error}（HTTP ${hit.status}，${ms}ms，经 ${hit.url}）`,
         detail: { status: hit.status, ms, edge: relayGuard.edge, error: relayGuard.error, upstreamOk, siteOk, via: hit.url },
       });
+    } else if (channelOk && prevSite === true && !siteOk) {
+      // 站点腿降级只记一条 info：它不影响发短信，但排障时值得知道这一跳变慢了
+      pushSysLog({
+        level: 'info', source: 'relay',
+        msg: `中继回探本站变慢/失败（参考项，通道正常）：${String((parsed && parsed.site && parsed.site.error) || '回探未通过')}`,
+        detail: { siteOk, ms, siteMs: (parsed && parsed.site && parsed.site.ms) || 0, via: hit.url },
+      });
     }
-    if (hit.ok) { relayFailStreak = 0; } else { await noteRelayFailure(relayGuard.error || '上游探针失败'); }
-    return { configured: true, ok: hit.ok, status: hit.status, ms, via: hit.url, result: parsed, tried };
+    if (channelOk) { relayFailStreak = 0; } else { await noteRelayFailure(relayGuard.error || '上游探针失败'); }
+    return { configured: true, ok: channelOk, status: hit.status, ms, via: hit.url, upstreamOk, siteOk, result: parsed, tried };
   } catch (e) {
     const ms = Date.now() - g0;
     const msg = String((e && e.message) || e);
     noteRelayHealth({ ok: false, ms, status: 0, src: 'guard', edge: '', via: '', timing: null, error: msg, endpoints: eps.length, upCount: 0 });
     const prev = relayGuard.lastOk;
-    Object.assign(relayGuard, { at: nowISO(), ok: false, ms, upstreamOk: false, siteOk: false, edge: '', error: msg, lastOk: false, via: '', timing: null, tried: [] });
+    Object.assign(relayGuard, { at: nowISO(), ok: false, ms, status: 0, upstreamOk: false, siteOk: false, edge: '', error: msg, lastOk: false, via: '', timing: null, tried: [] });
     if (prev === true) {
       pushSysLog({ level: 'warn', source: 'relay', msg: `双向陪护体检请求失败：${msg}`, detail: { ms } });
     }
@@ -2499,7 +2536,7 @@ function companionSnapshot() {
     endpoints: relayEndpoints(),
     relay: { ...relayHealth },
     guard: {
-      at: relayGuard.at, ok: relayGuard.ok, ms: relayGuard.ms,
+      at: relayGuard.at, ok: relayGuard.ok, ms: relayGuard.ms, status: relayGuard.status,
       upstreamOk: relayGuard.upstreamOk, siteOk: relayGuard.siteOk,
       build: relayGuard.build, edge: relayGuard.edge, error: relayGuard.error,
       via: relayGuard.via, timing: relayGuard.timing, tried: relayGuard.tried,
@@ -3371,11 +3408,13 @@ function smsCredFor(bindingId) {
         };
       }
       /*
-       * 单次发送超时：自动 30s；手动测试 20s。
-       * 手动路径要赶在前端 90 秒等待窗口内给出确定结果
-       * （manual 退避 3s × 最多 2 次尝试，20+3+20 = 43s，留足余量）。
+       * 父进程超时必须比子进程预算更长，否则子进程还没轮到重试就被 kill：
+       * 之前是「父 30s vs 子单次 30s」，第二次尝试必然被砍，重试等于没有，
+       * 而网关若已受理只是回包慢，父进程超时 → 任务判失败 → 下轮再发一遍（重复短信）。
+       * 现在自动 45s / 手动 40s（手动仍在前端 90s 等待窗口内），
+       * 子进程预算再减 5s，留出收尾与打印结果的时间。
        */
-      const execTimeout = opt && opt.manual ? 20000 : 30000;
+      const execTimeout = opt && opt.manual ? 40000 : 45000;
       const sgrRun = state.settings.smsGatewayRelay || {};
       const relayEps = relayEndpoints(sgrRun);
       const relayOn = !!(sgrRun.enabled && relayEps.length);
@@ -3390,6 +3429,8 @@ function smsCredFor(bindingId) {
           {
             env: {
               CRONHUB_SMS_CFG_DIR: cfgDir,
+              // 子进程总预算：父进程 execTimeout 留 5s 收尾，避免被 kill 在半途
+              CRONHUB_SMS_BUDGET_MS: String(execTimeout - 5000),
               ...(relayOn ? {
                 // 多地址用逗号分隔：子进程按顺序试，首个成功即停（主挂备上）
                 CRONHUB_SMS_RELAY_URL: relayEps.join(','),
@@ -6440,9 +6481,17 @@ async function handleApi(req, res, url) {
     });
   }
 
-  /* 手动触发一次双向陪护体检：只读探针，不触发调度、不发短信 */
+  /*
+   * 手动触发一次双向陪护体检：只读探针，不触发调度、不发短信。
+   * 鉴权：开着访问控制时要求登录（它每次都是一次十几秒的出站，不该让访客免费放大）；
+   * 缓存：60 秒内重复调用直接回上次结果，手动按钮用 ?force=1 强制重测。
+   */
   if (pathname === '/api/relay/guard') {
-    return sendJSON(res, 200, await guardSmsRelay());
+    if (REQUIRE_PASSWORD && !isAuthed(req)) {
+      return sendJSON(res, 401, { ok: false, error: '未登录或登录已过期' });
+    }
+    const force = /^(1|true|yes)$/i.test(String(url.searchParams.get('force') || ''));
+    return sendJSON(res, 200, await guardSmsRelay({ force }));
   }
 
   /*

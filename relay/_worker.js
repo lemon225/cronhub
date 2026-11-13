@@ -1,6 +1,12 @@
 /**
  * CronHub SMS Relay · Cloudflare Pages（Advanced Mode / 根目录单文件 _worker.js）
- * RELAY_VER = relay-v3 · 2026-11-12
+ * RELAY_VER = relay-v4 · 2026-11-14
+ *
+ * v4（批次 A 止血）：
+ *   · /__guard 的 ok 判据只看上游腿 —— 短信发不发得出去由「CF → 网关」决定；
+ *     站点腿（CF → 国内实例）常因冷启动越过 12s，拿它一起判失败会把「短信明明能发」
+ *     误报成中继异常，进而推假警报。站点腿降级为参考项，单独回 siteOk。
+ *   · SITE_TIMEOUT_MS 默认 12s → 20s，减少冷启动误判（仍不影响通道健康判定）。
  *
  * 职责：把 CronHub 云端发来的短信请求原样中转到移动网关，并提供双向陪护探针。
  *
@@ -46,7 +52,7 @@
  *   · /__guard 只打 /api/health，绝不打 /api/wake —— 后者触发调度会形成回环
  */
 
-const RELAY_VER = 'relay-v3';
+const RELAY_VER = 'relay-v4';
 const DEFAULT_HOST = '5gvas01.cmicmaap.com';
 
 const SITE_HEALTH_INLINE = 'https://cronhub.app.workbuddy.host/api/health?sharecode=ZDRK2MO6CP';
@@ -72,7 +78,7 @@ function num(v, dflt, min, max) {
 function timeouts(env) {
   return {
     probe: num(env.PROBE_TIMEOUT_MS, 12000, 1000, 30000),
-    site: num(env.SITE_TIMEOUT_MS, 12000, 1000, 30000),
+    site: num(env.SITE_TIMEOUT_MS, 20000, 1000, 30000),
     wake: num(env.WAKE_TIMEOUT_MS, 15000, 1000, 30000),
     forward: num(env.FORWARD_TIMEOUT_MS, 20000, 1000, 60000),
   };
@@ -299,7 +305,10 @@ export default {
     /*
      * 双向陪护：一次请求同时看「CF → 上游网关」和「CF → CronHub 站点」。
      * 站点侧打的是只读 /api/health，绝不打 /api/wake（后者触发 tick 会回环）。
-     * 两侧都通才回 200，任一失败回 502 —— 自检任务直接用 HTTP 状态码判定。
+     *
+     * v4：通道健康只看上游腿。站点腿是「回探能力」，CF 边缘到国内实例常因冷启动
+     * 越过 SITE_TIMEOUT，把它算进 ok 会把「短信能发」误报成中继故障（假警报）。
+     * 因此 ok / HTTP 码只由 upstream 决定，siteOk 单列，调用方自行当参考。
      */
     if (url.pathname === '/__guard') {
       const t0 = Date.now();
@@ -307,18 +316,22 @@ export default {
         probeUpstream(origin, wantHost, T.probe),
         checkSite(env, T.site),
       ]);
-      const ok = up.ok && site.ok;
+      const channelOk = !!up.ok;
+      const siteOk = !!site.ok;
       const out = {
-        ok, ver: RELAY_VER, edge, user: userId,
+        ok: channelOk, channelOk, siteOk, ver: RELAY_VER, edge, user: userId,
         at: new Date().toISOString(), ms: Date.now() - t0,
         upstream: up,
         site,
-        hint: ok
-          ? '两侧均正常：网站可经中继发短信，中继可回探网站健康'
-          : '任一侧异常；看 upstream / site 里的 error 与 errorKind 定位',
+        verdict: channelOk ? (siteOk ? 'ok' : 'channel-ok-site-slow') : 'upstream-down',
+        hint: channelOk
+          ? (siteOk
+            ? '两侧均正常：网站可经中继发短信，中继可回探网站健康'
+            : '短信通道正常（上游通）；站点回探偏慢，仅作参考，不影响通道健康')
+          : '上游网关不通：短信发不出去，看 upstream.error / errorKind',
       };
-      logLine({ kind: 'guard', user: userId, ok, upOk: up.ok, siteOk: site.ok, ms: out.ms, edge });
-      return json(out, ok ? 200 : 502);
+      logLine({ kind: 'guard', user: userId, ok: channelOk, upOk: up.ok, siteOk, ms: out.ms, edge });
+      return json(out, channelOk ? 200 : 502);
     }
 
     // ---------- 4) 纯转发：path / query / method / headers / body 原样 ----------
