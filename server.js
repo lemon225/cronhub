@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-16';
+const SMS_BUILD = 'audit-batch-18';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -679,6 +679,21 @@ function loadState() {
        * 不随状态持久化的话每次重启都归零，等于没统计。
        */
       smsAuthStats: parsed.smsAuthStats && typeof parsed.smsAuthStats === 'object' ? parsed.smsAuthStats : null,
+      /*
+       * 运行指标（第十八批）：24 小时 × 5 分钟桶的执行计数。
+       * 只保留结构合法的桶 —— 手改过 state.json 的桶可能是字符串或 null，
+       * metricsSnapshot 会按 typeof b.t === 'number' 再滤一次，两边都不信任输入。
+       */
+      metrics: (() => {
+        const m = parsed.metrics;
+        const buckets = Array.isArray(m && m.buckets) ? m.buckets : [];
+        return {
+          buckets: buckets.filter((b) => b && typeof b.t === 'number' && Number.isFinite(b.t)).slice(-METRIC_BUCKETS),
+          startedAt: (m && typeof m.startedAt === 'string' ? m.startedAt : '') || '',
+        };
+      })(),
+      // 死信水位：跨重启记住「已经告警到第几档」，否则每次重启都会重发一遍同样的告警
+      deadLetterAlert: Number(parsed.deadLetterAlert) > 0 ? Number(parsed.deadLetterAlert) : 0,
     };
     if (loaded.recovered) {
       reportStateRecovery(loaded, (state.tasks || []).length);
@@ -993,6 +1008,131 @@ function maskSecrets(text) {
   return String(text || '')
     .replace(/(sharecode=)[A-Za-z0-9]+/gi, '$1***')
     .replace(/(token=)[A-Za-z0-9_-]{6,}/gi, '$1***');
+}
+
+/* ---------------------------------------------------------------- 运行指标 */
+
+/*
+ * 「看得见」：把执行情况按 5 分钟一桶记 24 小时。
+ *
+ * 现状只能回答「累计跑了多少次、累计失败多少次」，回答不了真正被问到的问题：
+ * 「今天下午是不是整体变慢了」「失败是零星抖动，还是从 14:00 起全挂」
+ * 「重试救回来几次，还是每次都靠人手动补」。日志能翻，但要一条条数。
+ *
+ * 桶里只放计数和一个耗时分母/分子，不存明细；288 个桶约 20KB，随 state.json 一起落盘，
+ * 重启不清零（否则「昨天夜里到底稳不稳」永远查不到）。
+ */
+const METRIC_BUCKET_MS = 5 * 60 * 1000;
+const METRIC_BUCKETS = 288;
+const METRIC_HOURS = 24;
+
+function metricsState() {
+  if (!state.metrics || !Array.isArray(state.metrics.buckets)) {
+    state.metrics = { buckets: [], startedAt: nowISO() };
+  }
+  return state.metrics;
+}
+
+/** 取（必要时新建）当前时间所属的桶。桶永远按时间递增推进。 */
+function metricBucket(atMs) {
+  const ms = metricsState();
+  const key = Math.floor((Number(atMs) || Date.now()) / METRIC_BUCKET_MS) * METRIC_BUCKET_MS;
+  let b = ms.buckets.length ? ms.buckets[ms.buckets.length - 1] : null;
+  if (!b || b.t !== key) {
+    // 时间回拨（对时、DST）时不新建更早的桶，直接记到当前桶，避免环形缓冲被旧时间戳填满
+    if (b && key < b.t) return b;
+    b = { t: key, ok: 0, fail: 0, retry: 0, dl: 0, msSum: 0, msN: 0, maxMs: 0 };
+    ms.buckets.push(b);
+    if (ms.buckets.length > METRIC_BUCKETS) ms.buckets.splice(0, ms.buckets.length - METRIC_BUCKETS);
+  }
+  return b;
+}
+
+/**
+ * 记一笔。kind: ok | fail | retry（重试后成功救回）| dl（进死信）。
+ * 纯观测，绝不因为统计抛错影响任务执行 —— 整段 try 包住。
+ */
+function recordMetric(kind, info) {
+  try {
+    const b = metricBucket();
+    if (kind === 'ok' || kind === 'fail') {
+      b[kind] += 1;
+      const d = Number(info && info.duration);
+      if (Number.isFinite(d) && d >= 0) {
+        b.msSum += d;
+        b.msN += 1;
+        if (d > b.maxMs) b.maxMs = d;
+      }
+    } else if (kind === 'retry') {
+      b.retry += 1;
+    } else if (kind === 'dl') {
+      b.dl += 1;
+    } else {
+      return;
+    }
+    saveStateLazy();
+  } catch (err) {
+    console.error('[metrics] 记录失败（已忽略）:', err.message);
+  }
+}
+
+/** 供 /api/health 与 /api/state 用的快照：24 根小时柱 + 三段汇总 */
+function metricsSnapshot() {
+  const ms = metricsState();
+  const now = Date.now();
+  const hourMs = 3600 * 1000;
+  const hourly = [];
+  for (let i = 0; i < METRIC_HOURS; i += 1) hourly.push({ ok: 0, fail: 0, retry: 0, dl: 0, msSum: 0, msN: 0, maxMs: 0 });
+  const horizon = now - METRIC_HOURS * hourMs;
+  let ok24 = 0;
+  let fail24 = 0;
+  let retry24 = 0;
+  let dl24 = 0;
+  let msSum24 = 0;
+  let msN24 = 0;
+  let ok1 = 0;
+  let fail1 = 0;
+  let retry1 = 0;
+  for (const b of ms.buckets) {
+    if (!b || typeof b.t !== 'number' || b.t < horizon) continue;
+    const idx = METRIC_HOURS - 1 - Math.min(METRIC_HOURS - 1, Math.floor((now - b.t) / hourMs));
+    const h = hourly[idx];
+    h.ok += b.ok || 0;
+    h.fail += b.fail || 0;
+    h.retry += b.retry || 0;
+    h.dl += b.dl || 0;
+    h.msSum += b.msSum || 0;
+    h.msN += b.msN || 0;
+    if ((b.maxMs || 0) > h.maxMs) h.maxMs = b.maxMs;
+    ok24 += b.ok || 0;
+    fail24 += b.fail || 0;
+    retry24 += b.retry || 0;
+    dl24 += b.dl || 0;
+    msSum24 += b.msSum || 0;
+    msN24 += b.msN || 0;
+    if (now - b.t <= hourMs) {
+      ok1 += b.ok || 0;
+      fail1 += b.fail || 0;
+      retry1 += b.retry || 0;
+    }
+  }
+  const avg = (sum, n) => (n ? Math.round(sum / n) : 0);
+  return {
+    buckets: ms.buckets.length,
+    startedAt: ms.startedAt || '',
+    hourly: hourly.map((h) => ({
+      ok: h.ok,
+      fail: h.fail,
+      retry: h.retry,
+      dl: h.dl,
+      avgMs: avg(h.msSum, h.msN),
+      maxMs: h.maxMs,
+    })),
+    last1h: { ok: ok1, fail: fail1, retry: retry1 },
+    last24h: { ok: ok24, fail: fail24, retry: retry24, dl: dl24, avgMs: avg(msSum24, msN24) },
+    // 成功率按 24 小时算；没有样本时给 null，前端显示「—」而不是假的 100%
+    successRate: ok24 + fail24 ? Math.round((ok24 / (ok24 + fail24)) * 1000) / 10 : null,
+  };
 }
 
 function seedState() {
@@ -1848,7 +1988,49 @@ function pushDeadLetter({ channel, label, title, body, markdown, message, attemp
     msg: `推送重试 ${entry.attempts} 次仍失败，已入死信：${label} · ${entry.message.slice(0, 150)}`,
     detail: { channel: entry.channel, label, taskName: entry.taskName, attempts: entry.attempts },
   });
+  recordMetric('dl');
+  checkDeadLetterWatermark();
   return entry;
+}
+
+/*
+ * 死信水位告警（第十八批）。
+ *
+ * 死信队列以前是「只进不出、无人看」：每失败一条就推一条站内通知，混在几十条正常通知里，
+ * 真到「短信通道整体挂了、一晚上堆了 20 条」时，反而没人能判断这是故障还是偶然。
+ * 这里按水位分档，跨档才推一次手机告警，档位写进 state 跨重启记忆（否则每次重启都重发）。
+ * 队列被清空或重放降到低水位时档位归零，下一次堆积能重新提醒。
+ */
+const DL_ALERT_STEPS = [5, 10, 20, 35, 50];
+
+function checkDeadLetterWatermark() {
+  try {
+    const n = (state.deadLetters || []).length;
+    if (!n) {
+      state.deadLetterAlert = 0;
+      return;
+    }
+    let level = 0;
+    for (const s of DL_ALERT_STEPS) if (n >= s) level = s;
+    const prev = Number(state.deadLetterAlert) || 0;
+    if (level <= prev) return;
+    state.deadLetterAlert = level;
+    const last = state.deadLetters[0] || {};
+    pushNotification({
+      level: 'error',
+      title: `📮 死信堆积 ${n} 条（跨过 ${level} 档）`,
+      body: `推送死信队列已堆到 ${n} 条（上限 ${DEAD_LETTER_MAX}），说明某个渠道在一段时间里持续送不出去。\n最近一条：${last.label || last.channel || '未知渠道'}${last.taskName ? ' · 任务「' + last.taskName + '」' : ''}\n原因：${String(last.message || '').slice(0, 200)}\n建议：确认该渠道凭据/额度是否正常，再到「死信」里重放或清空。`,
+      source: 'deadletter',
+    });
+    pushSysLog({
+      level: 'error',
+      source: 'channel',
+      msg: `死信堆积跨过 ${level} 档（当前 ${n} 条），已发水位告警`,
+      detail: { count: n, level, lastChannel: last.channel || '', lastLabel: last.label || '' },
+    });
+  } catch (err) {
+    console.error('[dead-letter] 水位检查失败（已忽略）:', err.message);
+  }
 }
 
 /** 统一发送：payload = {title, body, markdown}。 */
@@ -4756,6 +4938,17 @@ async function runTask(task, trigger) {
     task.failCount = 0;
   }
   /*
+   * 运行指标（第十八批）：成功 / 失败各记一笔，重试后成功另记「救回」。
+   *
+   * 「重试救回」是这一批真正想看见的数：失败次数只说明「有抖动」，
+   * 救回次数说明「抖动被自愈了，不用管」，两者混在一个数里就完全读不出结论。
+   * 放在告警之前 —— 统计不该被推送链路的任何异常牵连。
+   */
+  recordMetric(ok ? 'ok' : 'fail', { duration });
+  // 重试救回：重试循环里已经打了 warn 日志（见 runTask 的 attempts 分支），
+  // 这里只补一个指标计数 —— 日志是一次性的，指标才能看出「这周自愈了几次」。
+  if (ok && attempts > 1) recordMetric('retry');
+  /*
    * 连续失败升级为告警。
    *
    * 以前 failCount 只是个数字，挂在任务卡上等人自己发现 —— 签到连续失败一周也没人知道，
@@ -5928,6 +6121,13 @@ function publicState(role) {
     storage: stateStorageSnapshot(),
     // 补跑状态（第十六批）：页面据此显示「本次启动补跑了几 个、跳过了哪些、为什么跳过」
     catchup: catchupSnapshot(),
+    /*
+     * 运行指标（第十八批）：24 小时小时柱 + 1h/24h 汇总。
+     * 与「累计失败次数」不同，它带时间轴 —— 能分辨「零星抖动」和「从某点起全挂」。
+     */
+    metrics: metricsSnapshot(),
+    // 死信水位：条数与已告警档位，前端据此决定是否把死信入口标红
+    deadLetter: { count: (state.deadLetters || []).length, alertLevel: Number(state.deadLetterAlert) || 0 },
     meta: {
       now: nowISO(),
       timezone: process.env.TZ || state.settings.timezone || 'Asia/Shanghai',
@@ -6199,6 +6399,18 @@ async function handleApi(req, res, url) {
       storage: stateStorageSnapshot(),
       /* 补跑：本次启动补成几个、跳过几个。跳过原因是「没重复跑」的证据，必须能看到 */
       catchup: catchupSnapshot(),
+      /* 运行指标（第十八批）：只看汇总，小时柱在 /api/state 里给页面画图 */
+      metrics: (() => {
+        const m = metricsSnapshot();
+        return {
+          buckets: m.buckets,
+          successRate: m.successRate,
+          last1h: m.last1h,
+          last24h: m.last24h,
+        };
+      })(),
+      /* 死信水位：条数 + 已告警档位（档位为 0 表示从没跨档） */
+      deadLetter: { count: (state.deadLetters || []).length, alertLevel: Number(state.deadLetterAlert) || 0, max: DEAD_LETTER_MAX },
       /*
        * 调度健康（第十七批）：ticking 卡住多久、被看门狗强制解开过几次。
        * 「任务不跑了」以前只能靠人发现，现在这一个对象就能看出来。
@@ -7340,6 +7552,7 @@ async function handleApi(req, res, url) {
     });
     if (r.ok) {
       state.deadLetters = list.filter((x) => x.id !== id);
+      checkDeadLetterWatermark();
       saveState();
       return sendJSON(res, 200, { ok: true, message: `已重放：${r.message || '送达'}` });
     }
@@ -7352,6 +7565,8 @@ async function handleApi(req, res, url) {
     if (!needSmsAdmin(req, res, '清空死信队列')) return;
     const n = (state.deadLetters || []).length;
     state.deadLetters = [];
+    // 清空 = 水位归零，下次再堆积能重新提醒（否则档位记着 50，永远不再告警）
+    checkDeadLetterWatermark();
     saveState();
     pushSysLog({ level: 'info', source: 'channel', msg: `死信队列已清空（${n} 条）`, detail: { action: 'deadletter.clear', count: n } });
     return sendJSON(res, 200, { ok: true, cleared: n });
@@ -9116,6 +9331,14 @@ process.on('unhandledRejection', (reason) => {
 });
 
 loadState();
+
+/*
+ * 死信水位体检（第十八批）：启动时也看一眼。
+ * 场景是「上一版没记档位就重启了」或者「进程被回收时队列里已经堆着 30 条」——
+ * 只在 pushDeadLetter 里检查的话，这批历史死信要等到下一次投递失败才会被看见。
+ * 档位持久化，所以同一个水位只会告警一次，重启不会重发。
+ */
+checkDeadLetterWatermark();
 
 /*
  * 日志保留期清理：启动先扫一次，之后每小时扫一次。

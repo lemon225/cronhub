@@ -501,7 +501,75 @@ function renderStats() {
       <div class="stat-value">${esc(c.value)}<i>${esc(c.unit)}</i></div>
       <div class="stat-foot">${esc(c.foot)}</div>
     </div>`).join('');
+
+  renderMetrics();
 }
+
+/*
+ * 近 24 小时运行指标（第十八批）。
+ *
+ * 上面四张卡都是「累计数」：累计跑了 200 次、累计失败 7 次。累计数回答不了
+ * 「昨天夜里稳不稳」「失败是零星抖动还是从 14:00 起全挂」—— 那两个问题才决定
+ * 要不要现在动手。所以这里补一条带时间轴的小图：每小时一根柱，有失败的那根标红，
+ * 鼠标悬停给出该小时的成功/失败/平均耗时。
+ *
+ * 服务端只下发 24 个小时桶的计数（见 metricsSnapshot），前端不做任何聚合，
+ * 免得两边口径不一致。
+ */
+function renderMetrics() {
+  const box = $('#metricStrip');
+  if (!box) return;
+  const m = S.data && S.data.metrics;
+  const hours = (m && Array.isArray(m.hourly)) ? m.hourly : [];
+  const total = hours.reduce((n, h) => n + (h.ok || 0) + (h.fail || 0), 0);
+  if (!total) {
+    // 刚部署或刚清空：一个样本都没有时不显示空图，避免「一排水管」看着像故障
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+
+  const maxTotal = Math.max(1, ...hours.map((h) => (h.ok || 0) + (h.fail || 0)));
+  const nowHour = new Date();
+  nowHour.setMinutes(0, 0, 0);
+  const bars = hours.map((h, i) => {
+    const ok = h.ok || 0;
+    const fail = h.fail || 0;
+    const sum = ok + fail;
+    // 空小时留一条 4% 高的底桩，让人看得出「这一格是 0 次」而不是「没有数据」
+    const hPct = sum ? Math.max(6, Math.round((sum / maxTotal) * 100)) : 4;
+    const cls = sum ? (fail ? 'is-bad' : 'is-ok') : 'is-idle';
+    const label = new Date(nowHour.getTime() - (hours.length - 1 - i) * 3600 * 1000);
+    const hh = `${String(label.getHours()).padStart(2, '0')}:00`;
+    const tip = `${hh} · 成功 ${ok} · 失败 ${fail}${h.retry ? ` · 重试救回 ${h.retry}` : ''}${sum ? ` · 平均 ${h.avgMs || 0}ms` : ''}`;
+    return `<i class="ms-bar ${cls}" style="--h:${hPct}%" title="${esc(tip)}" aria-label="${esc(tip)}"></i>`;
+  }).join('');
+
+  const sum24 = m.last24h || {};
+  const rate = m.successRate == null ? '—' : `${m.successRate}%`;
+  const dl = (S.data && S.data.deadLetter) || {};
+  const dlCount = Number(dl.count) || Number(sum24.dl) || 0;
+  const dlHot = Number(dl.alertLevel) > 0;
+
+  box.innerHTML = `
+    <div class="ms-head">
+      <b>近 24 小时</b>
+      <span class="ms-chips">
+        <span class="ms-chip">成功 <b>${esc(sum24.ok || 0)}</b></span>
+        <span class="ms-chip${sum24.fail ? ' is-warn' : ''}">失败 <b>${esc(sum24.fail || 0)}</b></span>
+        <span class="ms-chip${sum24.retry ? ' is-ok' : ''}">重试救回 <b>${esc(sum24.retry || 0)}</b></span>
+        <span class="ms-chip${dlHot ? ' is-bad' : ''}">死信 <b>${esc(dlCount)}</b></span>
+      </span>
+    </div>
+    <div class="ms-bars">${bars}</div>
+    <div class="ms-foot">
+      <span>成功率 ${esc(rate)}</span>
+      <span>平均耗时 ${esc(sum24.avgMs || 0)}ms</span>
+      <span>最近 1 小时 成功 ${esc((m.last1h || {}).ok || 0)} / 失败 ${esc((m.last1h || {}).fail || 0)}</span>
+    </div>`;
+}
+
 
 function renderNext() {
   const tasks = S.data.tasks
