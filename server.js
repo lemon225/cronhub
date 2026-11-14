@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-20';
+const SMS_BUILD = 'audit-batch-21';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -370,14 +370,22 @@ function pruneExpiredLogs() {
 }
 
 /**
- * 单条执行记录里保留的响应正文上限（字符）。
+ * 单条执行结果里保留的响应正文上限（字符）—— 安全阀，不是业务限制。
  *
- * 以前只留 120 字，连一个天气接口的字段都放不完整，排障基本靠猜。
- * 现在完整保留，但必须有上限 —— 状态文件是整份 JSON 落盘的，300 条 × 无限长正文
- * 会把 data/state.json 撑到几十 MB，每次 flushState 都变慢。
- * 8000 字能装下绝大多数接口响应和报错堆栈，超出的会显式标注被截断。
+ * 第二十一批：以前这里只有 8000 字，步骤日志又把每步响应单独截到 2000 字，
+ * 和风天气 14173 字的逐时预报被砍掉大半；AI 材料另有 5000 字上限、AI 前原文只留 800 字。
+ * 用户明确「允许全部接受」，于是展示 / 落盘 / AI 材料统一到这一处上限，
+ * 默认 20 万字（约 400KB），正常接口永远碰不到，不会再出现业务数据被截。
+ *
+ * 仍保留上限的理由：state.json 是整份 JSON 落盘的，300 条 × 无限长正文
+ * 会把写盘拖慢甚至撑爆内存。真遇到异常大响应会显式标注被截断。
+ * CRONHUB_BODY_MAX=0 完全关闭截断；也可设成具体字符数。
  */
-const RESULT_BODY_MAX = 8000;
+const RESULT_BODY_MAX = (() => {
+  const raw = Number(process.env.CRONHUB_BODY_MAX);
+  if (!Number.isFinite(raw) || raw < 0) return 200000;
+  return Math.round(raw);
+})();
 
 /**
  * 任务失败自动重试的次数上限。
@@ -390,17 +398,19 @@ const RETRY_MAX_TIMES = 3;
 /** 把正文裁到上限，被裁时明确告诉读者「这里少了一截」以及原文有多长。 */
 function clipBody(text, max = RESULT_BODY_MAX) {
   const s = String(text == null ? '' : text);
-  if (s.length <= max) return s;
-  return s.slice(0, max) + `\n…（已截断：原文共 ${s.length} 字，仅保留前 ${max} 字）`;
+  const lim = max == null ? RESULT_BODY_MAX : Number(max);
+  if (!Number.isFinite(lim) || lim <= 0 || s.length <= lim) return s;
+  return s.slice(0, lim) + `\n…（已截断：原文共 ${s.length} 字，仅保留前 ${lim} 字）`;
 }
 
 /** 多步骤任务的响应拼成一段，每步加分隔标题，方便在一条日志里顺着看下去。 */
 function joinStepBodies(steps) {
   const list = (steps || []).filter((s) => s && s.response);
   if (!list.length) return '';
-  if (list.length === 1) return clipBody(list[0].response, RESULT_BODY_MAX);
-  const parts = list.map((s) => `── ${s.name || '步骤'}${s.ok === false ? '（失败）' : ''} ──\n${clipBody(s.response, 3000)}`);
-  return clipBody(parts.join('\n\n'), RESULT_BODY_MAX);
+  if (list.length === 1) return clipBody(list[0].response);
+  // 每步各自受安全阀约束，合计不再二次截断 —— 5 个步骤都返回长正文时，
+  // 旧的「合计 8000」会把后面几步整段吃掉，正是这次要修的问题。
+  return list.map((s) => `── ${s.name || '步骤'}${s.ok === false ? '（失败）' : ''} ──\n${clipBody(s.response)}`).join('\n\n');
 }
 
 /* ---------------------------------------------------------------- 状态层 */
@@ -2750,8 +2760,9 @@ async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskNa
     return {
       title: String(parsed.title).slice(0, 40),
       // 模型有时把换行写成字面 \n 而非 JSON 转义，统一还原成真换行，
-      // 否则分行卡片式会退化成一整段。上限 800 字：再长就不适合进通知栏了。
-      body: String(parsed.body || '').replace(/\\n/g, '\n').slice(0, 800),
+      // 否则分行卡片式会退化成一整段。不再静默截到 800 字：
+      // 正常输出远短于此，异常跑飞时才裁，且裁了会明确标注。
+      body: clipBody(String(parsed.body || '').replace(/\\n/g, '\n')),
     };
   };
 
@@ -4222,9 +4233,8 @@ async function runHttpTask(task) {
     const hint = friendly[key] || (err.name === 'TimeoutError' ? '请求超时，可适当调大超时时间' : String(cause || '网络请求失败'));
     throw new Error(`请求失败：${hint}`);
   }
-  // 完整正文用于解析，展示时才截断 —— 先截断会导致 JSON 残缺解析失败
+  // 完整正文用于解析，展示时才裁到安全阀 —— 先截断会导致 JSON 残缺解析失败
   const fullText = await res.text().catch(() => '');
-  const text = fullText.slice(0, 300);
   const expect = Number(cfg.expectStatus) || 200;
   // 除主状态码外，允许额外声明「也算成功」的状态码（数组或逗号分隔）。
   // 典型用途：签到接口在今日已签时返回 400，那不是故障，不该报红。
@@ -4234,23 +4244,24 @@ async function runHttpTask(task) {
   if (!okCodes.includes(res.status)) {
     // 失败更要看正文 —— 上游的报错原因（余额不足、令牌过期、参数缺失）全在里面。
     // 挂在 error 对象上带出去，由 runTask 写进执行记录。
-    const e = new Error(`状态码 ${res.status}，期望 ${okCodes.join('/')}。响应：${clipBody(fullText, 2000) || '(空)'}`);
+    const e = new Error(`状态码 ${res.status}，期望 ${okCodes.join('/')}。响应：${clipBody(fullText) || '(空)'}`);
     e.httpStatus = res.status;
-    e.responseBody = clipBody(fullText, RESULT_BODY_MAX);
+    e.responseBody = clipBody(fullText);
     throw e;
   }
   const soft = res.status !== expect ? `（${res.status}，属可接受状态）` : '';
   return {
-    // 正文不再截到 120 字：那点长度连一个天气接口的字段都放不下，排障时还得再去猜。
-    // 完整正文另有 response 字段承载（见 RESULT_BODY_MAX），message 里只做摘要展示。
-    message: `请求成功${soft} ${res.status}，耗时 ${Date.now() - t0}ms。响应：${clipBody(fullText, 2000) || '(空)'}`,
+    // 正文不再截到 2000 字：和风天气单步就有 14173 字，砍掉后半段等于把
+    // 明天傍晚的雨雪数据弄丢。message / text / response 现在都是同一份完整正文，
+    // 只受 RESULT_BODY_MAX 这个异常安全阀约束。
+    message: `请求成功${soft} ${res.status}，耗时 ${Date.now() - t0}ms。响应：${clipBody(fullText) || '(空)'}`,
     ok: true,
     status: res.status,
     soft: res.status !== expect,
     ms: Date.now() - t0,
     json: tryParseJSON(fullText),
-    text: fullText.slice(0, 1000),
-    response: clipBody(fullText, RESULT_BODY_MAX),
+    text: clipBody(fullText),
+    response: clipBody(fullText),
     stepName: cfg.name || '',
   };
 }
@@ -4611,9 +4622,12 @@ function summarizeQWeatherStep(j) {
 }
 
 function summarizeStepData(steps, cap) {
-  // 12 个时段 × 2 天 ≈ 4.4k 字，比原来 6 个时段翻倍；上限同步放宽，
-  // 否则「明天傍晚」那段会被 …（数据已截断）吃掉，雨雪判断就漏了。
-  const limit = Math.max(400, Math.min(8000, Number(cap) || 5000));
+  // 只有调用方显式给 cap（通知栏兜底摘要 600 字）才压缩；
+  // 给 AI 的事实材料默认全部给出 —— 旧的 5000/8000 上限会把「明天傍晚」那段吃掉，
+  // 雨雪判断直接漏掉。上限统一到 RESULT_BODY_MAX 这个异常安全阀。
+  const limit = cap == null
+    ? RESULT_BODY_MAX
+    : Math.max(400, Math.min(RESULT_BODY_MAX, Number(cap) || 5000));
   // 覆盖傍晚到次日傍晚的完整 24 小时，约每 2 小时一个采样点
   const KEY_HOURS = new Set(['17:00', '18:00', '20:00', '22:00', '00:00', '02:00',
     '06:00', '08:00', '10:00', '12:00', '14:00', '16:00']);
@@ -4698,7 +4712,7 @@ function summarizeStepData(steps, cap) {
     }
   }
   const text = out.join('\n');
-  return text.length > limit ? text.slice(0, limit) + '\n…（数据已截断）' : text;
+  return limit > 0 && text.length > limit ? text.slice(0, limit) + '\n…（数据已截断）' : text;
 }
 
 /**
@@ -4943,7 +4957,7 @@ async function runTask(task, trigger) {
     ok: s.ok !== false,
     status: s.status == null ? null : s.status,
     json: s.json || null,
-    ...(s.ok === false ? { error: String(s.error || '').slice(0, 200) } : {}),
+    ...(s.ok === false ? { error: clipBody(s.error || '') } : {}),
   }));
   task.lastResult = { ok, message, duration, trigger, steps: stepDigest, response: responseBody || '', ...(attempts > 1 ? { attempts } : {}) };
   task.runCount = (task.runCount || 0) + 1;
@@ -4958,7 +4972,7 @@ async function runTask(task, trigger) {
       ok,
       duration,
       trigger,
-      message: String(message || '').slice(0, 600),
+      message: clipBody(message || ''),
       attempts: attempts > 1 ? attempts : undefined,
       steps: stepDigest.length ? stepDigest : undefined,
     },
@@ -5103,9 +5117,9 @@ async function runTask(task, trigger) {
          * 用户按任务名找不到对应通知。AI 只负责正文，不碰标题。
          */
         // 留一份 AI 之前的原文：通知详情里能直接切换比对「到底改了什么」，
-        // 这是用户判断「AI 有没有用」唯一靠得住的依据。截 800 字 —— 通知只留 200 条，
-        // 不封顶的话长正文（多步骤接口的原始输出）会把 state 撑大好几倍。
-        notice.rawBody = String(notice.body || '').slice(0, 800);
+        // 这是用户判断「AI 有没有用」唯一靠得住的依据。以前只留 800 字，
+        // 多步骤任务的原文后半段直接消失；现在完整保留，只受统一安全阀约束。
+        notice.rawBody = clipBody(notice.body || '');
         notice.body = polished.body;
         /*
          * 标注要能核对：以前只写「按任务要求」，但模型可能压根没照做，用户看到的
