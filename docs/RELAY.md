@@ -1,8 +1,9 @@
 # CronHub × Cloudflare 中继技术文档
 
-> 版本：`relay-v3` / `companion-v3` · **2026-11-12 22:54 已上线**（`/__status` 回 `ver: relay-v3`，Worker `modified_on` 同步更新）
+> 版本：`relay-v4` / `companion-v3` · **2026-11-14 已上线**（`/__status` 回 `ver: relay-v4`）
 > 源码：`relay/_worker.js`（Pages 中继）、`relay/worker-companion.js`（定时陪护 Worker）、`relay/index.html`
 > 线上：`https://cronhub-sms-relay.pages.dev` · 站点 `https://cronhub.app.workbuddy.host/?sharecode=ZDRK2MO6CP`
+> 根因证据、超时预算、判据语义、实测基线、已知限制 → [`SMS-CHAIN.md`](SMS-CHAIN.md)（本文只讲「怎么操作」）
 
 ---
 
@@ -19,7 +20,7 @@
 | 加冗余 | 重试**粘住**上次可用的中继，不再每轮从主地址重来 | 3 轮重试少两次无谓失败 |
 | 加冗余 | 连续 2 次体检失败推 NotifyMe（1 小时去重），**不走短信** | 短信挂掉时仍有独立告警通道 |
 | 可观测 | `relayHealth.timing` = `reused / connectMs / tlsMs / ttfbMs / totalMs`，设置页一行展示 | `2 条中继（通 1 条） · 当前经 … · 连接复用 · 首字节 909ms` |
-| 可观测 | 中继转发响应新增 `x-relay-upstream-ms`（relay-v3，**待上线**） | 把「本站→CF」与「CF→网关」分开看 |
+| 可观测 | 中继转发响应带 `x-relay-upstream-ms`（v3 起已上线；**站点侧仍未消费**，见 `SMS-CHAIN.md` §11） | 把「本站→CF」与「CF→网关」分开看 |
 
 > **判定「是否复用」不要看 `socket.connecting`**：TLS socket 上它不可靠，新建的 https 连接也会读成
 > `false`，会把每次新建都标成「复用」。现在的判据是「这次请求期间有没有真的发生 connect 事件」。
@@ -59,7 +60,7 @@ CronHub 的短信**只能**经 Cloudflare Pages 中继发出；网站与 Cloudfl
 | 项目名 | `cronhub-sms-relay` | `sms-relay` |
 | 域名 | `cronhub-sms-relay.pages.dev` | `sms-relay.*.workers.dev` |
 | 源码 | `relay/_worker.js` | `relay/worker-companion.js` |
-| 版本标记 | `relay-v2`（响应头 `x-relay-ver`） | `companion-v2`（日志 `ver` 字段） |
+| 版本标记 | `relay-v4`（响应头 `x-relay-ver`） | `companion-v3`（日志 `ver` 字段） |
 | 职责 | 短信业务转发 + 探针 + 双向体检 | 每 30 分钟从外部唤醒网站 |
 | 云端可达性 | ✅ 可达 | ❌ 被定向阻断（见 §3） |
 | 触发方式 | 被网站请求 | Cloudflare Cron Trigger `*/30 * * * *` |
@@ -212,13 +213,14 @@ curl -s -H "Authorization: Bearer $TOK" \
 ### 6.2 Pages 中继（唯一验证可行的组合）
 
 ```bash
-cd D:/Temp/2026-11-08-cloudflare-relay
+cd <任意非项目内的空目录>          # 不要用 D:\Temp（每日清理），也不要把产物留在项目里
+mkdir -p pages-adv
 cp <项目>/relay/_worker.js pages-adv/_worker.js
 cp <项目>/relay/index.html pages-adv/index.html
 # 必须 Wrangler 3.28 + 根目录单文件 _worker.js（advanced mode）
 CLOUDFLARE_API_TOKEN=<Pages:Edit 令牌> \
 CLOUDFLARE_ACCOUNT_ID=7c502eedc21c540887e31422d55009ea \
-node node_modules/wrangler/bin/wrangler.js pages deploy pages-adv \
+node <wrangler>/bin/wrangler.js pages deploy pages-adv \
   --project-name cronhub-sms-relay --commit-dirty=true
 ```
 
@@ -228,13 +230,13 @@ node node_modules/wrangler/bin/wrangler.js pages deploy pages-adv \
 
 ```bash
 curl -s -H "X-Relay-Secret: $SECRET" https://cronhub-sms-relay.pages.dev/__status
-# 期望 ver=relay-v2，响应头 x-relay-ver: relay-v2
+# 期望 ver=relay-v4，响应头 x-relay-ver: relay-v4
 ```
 
 ### 6.3 Workers 定时陪护
 
 ```bash
-TOK=<Workers:Edit 令牌> node D:/Temp/2026-11-10-cronhub-b8/upload-companion.cjs
+TOK=<Workers:Edit 令牌> node D:/Backuuup/workbuddy/cronhub/cloudflare/upload-worker.cjs
 ```
 
 上传脚本用 multipart：`metadata.json`（`main_module=worker.js`）+ `worker.js`（module 类型）。
@@ -315,7 +317,7 @@ schedules http 200 {"schedules":[{"cron":"*/30 * * * *", ...}]}
 
 | 症状 | 先查 | 判据与处置 |
 |---|---|---|
-| 短信全失败 | `/__status` | `ver` 不是 `relay-v2` → 部署没生效；`wakeConfigured:false` → 令牌配置丢 |
+| 短信全失败 | `/__status` | `ver` 不是 `relay-v4` → 部署没生效；`wakeConfigured:false` → 令牌配置丢 |
 | 短信全失败，status 正常 | `/__probe` | `ok:false` + `errorKind:timeout` → 网关侧抖动；`ok:true,status:403` → 中继没问题，查网站侧凭据/额度 |
 | 网站睡过头 | `/api/health` 的 `companion.wake` | `lastWokeAt` 不前进 → Worker Cron 掉了，按 §6.3 核对 `schedules` 与 `handlers` |
 | 唤醒 401 | 两面令牌比对 | `settings.wake.token` 与 Worker 的 `WAKE_TOKEN`/内置值不一致 → 走 §7 轮换 |
@@ -335,11 +337,16 @@ schedules http 200 {"schedules":[{"cron":"*/30 * * * *", ...}]}
 | `relay/_worker.js` | Pages 中继源码（部署时复制到 `pages-adv/_worker.js`） |
 | `relay/worker-companion.js` | Workers 定时陪护源码 |
 | `relay/index.html` | 中继占位说明页 |
-| `docs/RELAY.md` | 本文 |
+| `docs/RELAY.md` | 本文：端点、部署流程、轮换 runbook |
+| `docs/SMS-CHAIN.md` | 短信链路技术档案：根因证据链、超时预算、判据语义、实测基线、待办 |
 | `docs/CHANGELOG.md` | 更新记录 |
 | `README.md` | 主站说明（含中继章节索引） |
-| `D:/Temp/2026-11-10-cronhub-b8/relay-test/local.mjs` | 30 项本地回归（模拟 CF 边缘，不起服务） |
-| `D:/Temp/2026-11-10-cronhub-b8/smoke9.js` | 41 项第九批冒烟（静态 + 本地 API + 线上闭环） |
-| `D:/Temp/2026-11-08-cloudflare-relay/` | 部署产物、备份、API 令牌候选、历史探针（未删除） |
+| `tests/relay-worker-local.test.cjs` | 中继本地回归 27 项：直接加载 `relay/_worker.js`，模拟 CF 边缘，不起服务 |
+| `tests/relay-guard.test.cjs` / `relay-api.test.cjs` | 站点侧陪护判据、体检端点鉴权与缓存 |
+| `tests/sms-budget.test.cjs` | 发送侧预算收缩与「发出去了才超时」语义 |
 
-> `relay/` 与 `docs/` 虽然随项目一起部署，但**不会被网站静态暴露**：服务端静态资源走 `STATIC_REVEAL` 白名单，`/relay/_worker.js`、`/docs/RELAY.md` 实测均返回 404。源码里的内置兜底密钥因此不会多一个公开读取面。
+> 早期验证脚本散落在 `D:\Temp\2026-11-0*`（该目录每日 23:00 清理），
+> 已在第二十二批收进 `tests/` 并改为直载源码，不再依赖任何临时目录。
+> 部署产物目录同理：`pages-adv` 可建在任意**非项目内**的空目录，不要写在 `D:\Temp` 之外的地方留副本。
+>
+> `relay/` 与 `docs/` 虽然随项目一起部署，但**不会被网站静态暴露**：服务端静态资源走 `STATIC_REVEAL` 白名单，`/relay/_worker.js`、`/docs/RELAY.md`、`/docs/SMS-CHAIN.md` 实测均返回 404。源码里的内置兜底密钥因此不会多一个公开读取面。

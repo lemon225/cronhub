@@ -2,9 +2,35 @@
 
 > 倒序排列。`build` 与 `/api/health` 的 `build` 字段一致，可直接核对线上跑的是哪一版。
 > 线上地址：<https://cronhub.app.workbuddy.host/?sharecode=ZDRK2MO6CP>
-> 中继技术文档见 `docs/RELAY.md`。
+> 中继技术文档见 `docs/RELAY.md`；短信链路的根因、预算与判据见 `docs/SMS-CHAIN.md`。
 
 ---
+
+## 2026-11-14 · 第二十二批 · 文档 · 短信链路技术档案入仓（不改 `build`，线上仍 `audit-batch-21`）
+
+**背景**：Cloudflare 中继这条链路的结论性细节（为什么必须走中继、各层超时怎么定、
+「发出去了才超时」为什么不能重试、陪护为什么只看上游腿）一直散在会话记录和
+`D:\Temp\2026-11-0*` 各目录里。后者每天 23:00 被清理，等于每次改动都在拿消耗品当依据；
+`RELAY.md` 也把 `local.mjs`、`smoke9.js` 当成外部路径引用，换个环境就断链。
+
+**改动**：
+
+| 项 | 内容 |
+| --- | --- |
+| 新增 `docs/SMS-CHAIN.md` | 12 节技术档案：根因证据链（6 组实测对照）、已否证路线、超时预算表、`connectMs` 语义与换路矩阵、`verdict` 判据、实测基线、故障模式对照、密钥状态、演进时间线、P1/P2 待办、文件归属 |
+| 新增 `tests/relay-worker-local.test.cjs` | 27 项中继回归，**用 `data:` URL 直接 import `relay/_worker.js`**，改完源码立刻可验，不再维护快照副本 |
+| `docs/RELAY.md` | 版本号 `relay-v3` → `relay-v4`；顶部与 §10 加交叉引用；删掉 `D:\Temp` 依赖，部署产物目录改为「任意非项目内空目录」；排障表 `ver` 判据同步到 v4 |
+| `docs/CHANGELOG.md` / `README.md` | 索引补 `SMS-CHAIN.md` 与 `tests/` |
+
+**验证**：`node tests/relay-worker-local.test.cjs` → **27/27 通过**（约 3s）。
+覆盖鉴权（无/错/header/query/内联兜底）、白名单归一、`__probe` 403 视为连通、
+`__guard` 站点腿超时仍 `ok:true`、上游断连 `502 upstream-down`、
+转发 path/query/method/body 原样 + 私有头与 `?key=` 剥离、转发超时 504 vs 网络错 502、
+日志不含号码与密钥。`npm test` 全量另跑一遍确认无回归。
+
+**取舍**：文档与用例进仓会增加部署体积（`docs/` 已被 `STATIC_REVEAL` 白名单挡住，
+实测 404），换来的是「判据可复跑、结论不随临时目录消失」。
+本批不动任何运行逻辑，故不重新部署、不改 `build`。
 
 ## 2026-11-14 · 第二十一批 · `audit-batch-21` · 响应数据「允许全部接受」
 

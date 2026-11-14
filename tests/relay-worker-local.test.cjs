@@ -1,0 +1,248 @@
+/*
+ * 中继本地回归：直接加载 relay/_worker.js，模拟 Cloudflare 边缘，不起真实服务。
+ *
+ * 为什么直接加载源码：以前这套验证脚本是 D:\Temp 下的快照（_worker.mjs 副本），
+ * 源码一改脚本就过时，等于拿旧地图验收新地形。现在用 data: URL 动态 import
+ * 当前源码，改完立刻能验；也不需要把 .js 改名成 .mjs。
+ *
+ * 覆盖的是**判据**，不是实现细节：
+ *   鉴权 → 白名单 → 私有头/私有参数剥离 → 转发透传 → 超时与错误类别 → /__guard 只看上游腿
+ */
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const assert = require('assert');
+
+const SRC = path.join(__dirname, '..', 'relay', '_worker.js');
+const KEY = 'testkey-0123456789abcdef';
+const RELAY = 'https://relay.test';
+
+const ENV = {
+  RELAY_KEYS: 'tester:' + KEY,
+  SITE_HEALTH_URL: 'https://site.test/api/health?sharecode=zzz',
+  WAKE_URL: 'https://site.test/api/wake?sharecode=zzz',
+  SITE_TIMEOUT_MS: '1000',
+  FORWARD_TIMEOUT_MS: '1000',
+};
+
+let PASS = 0;
+let FAIL = 0;
+const out = (s) => process.stdout.write(s + '\n');
+function ok(name, cond, extra) {
+  if (cond) { PASS++; out('PASS | ' + name); }
+  else { FAIL++; out('FAIL | ' + name + (extra ? ' | ' + extra : '')); }
+}
+
+/* 中继的 logLine 会往 stdout 打 JSON，收起来既避免刷屏，也便于断言「日志里没有敏感内容」 */
+const logBuf = [];
+console.log = (line) => { logBuf.push(String(line)); };
+
+/* ---------- 模拟 CF 边缘：接管全局 fetch ---------- */
+let mode = 'ok';
+const seen = [];
+
+function hang(init) {
+  return new Promise((_, rej) => {
+    const sig = init && init.signal;
+    if (!sig) return; // 没有 signal 就永远挂着，测试会超时失败，正好暴露问题
+    sig.addEventListener('abort', () => {
+      const e = new Error('The operation was aborted');
+      e.name = 'AbortError';
+      rej(e);
+    });
+  });
+}
+
+globalThis.fetch = async (input, init = {}) => {
+  const url = String(input);
+  const hdrs = {};
+  new Headers(init.headers || {}).forEach((v, k) => { hdrs[k] = v; });
+  let body = '';
+  if (init.body) body = await new Response(init.body).text();
+  seen.push({ url, method: init.method || 'GET', headers: hdrs, body });
+
+  const isSite = url.startsWith('https://site.test');
+  if (isSite && mode === 'site-hang') return hang(init);
+
+  if (!isSite) {
+    if (mode === 'up-fail') {
+      const e = new Error('read ECONNRESET');
+      e.code = 'ECONNRESET';
+      throw e;
+    }
+    if (mode === 'fwd-hang') return hang(init);
+    // 网关对裸探针的正常响应就是 403
+    return new Response('{"code":403,"msg":"no auth"}', {
+      status: 403,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  return new Response(JSON.stringify({
+    ok: true, build: 'audit-batch-21', uptime: 123,
+    companion: { relay: { ok: true }, wake: { count: 7 } },
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+};
+
+function req(p, opts = {}) {
+  return new Request(RELAY + p, opts);
+}
+function authed(p, opts = {}) {
+  const headers = new Headers(opts.headers || {});
+  headers.set('x-relay-secret', KEY);
+  return req(p, { ...opts, headers });
+}
+
+(async () => {
+  const src = fs.readFileSync(SRC, 'utf8');
+  const mod = await import('data:text/javascript;base64,' + Buffer.from(src, 'utf8').toString('base64'));
+  const worker = mod.default;
+  const call = (r, env = ENV) => worker.fetch(r, env);
+
+  /* ---------- 1) 鉴权 ---------- */
+  {
+    const r = await call(req('/__status'));
+    ok('无密钥 → 403 forbidden', r.status === 403 && (await r.text()) === 'forbidden');
+  }
+  {
+    const r = await call(req('/__status?key=wrong'));
+    ok('错误密钥 → 403', r.status === 403);
+  }
+  {
+    const r = await call(req('/__status?key=' + KEY));
+    const j = await r.json();
+    ok('query 密钥可用（浏览器手测路径）', r.status === 200 && j.ver === 'relay-v4');
+  }
+  {
+    const r = await call(authed('/__status'));
+    const j = await r.json();
+    ok('header 密钥可用', r.status === 200 && j.user === 'tester');
+    const raw = JSON.stringify(j);
+    ok('/__status 不回显密钥', !raw.includes(KEY) && !raw.includes('dcb1470e'));
+    ok('/__status 不回显 sharecode', !raw.includes('sharecode'));
+  }
+  {
+    const r = await call(req('/__status'), {});
+    /*
+     * 这里断言的不是「503」而是「403」，因为源码里仍有 RELAY_KEYS_INLINE 兜底：
+     * env 为空时 keyring 也不为空，所以走鉴权而不是「未配置」分支。
+     * 这是一条**守门断言** —— 等密钥迁到 Pages 环境变量、内联常量删掉后，
+     * 这里会变成 503，用例就该跟着改，同时 docs/SMS-CHAIN.md §9 的风险条目要划掉。
+     */
+    ok('内联兜底仍生效：env 为空走鉴权（403）而非「未配置」503', r.status === 403,
+      'status=' + r.status);
+  }
+
+  /* ---------- 2) 上游白名单 ---------- */
+  {
+    const r = await call(authed('/__status', { headers: { 'x-relay-host': 'evil.example.com' } }));
+    const j = await r.json();
+    ok('白名单外主机 → 403', r.status === 403 && j.error === 'upstream not allowed');
+  }
+  {
+    const r = await call(authed('/__status', { headers: { 'x-relay-host': 'https://5gvas01.cmicmaap.com/sms' } }));
+    ok('白名单内主机（带 scheme/路径也能归一）→ 200', r.status === 200);
+  }
+
+  /* ---------- 3) 探针 ---------- */
+  {
+    mode = 'ok';
+    const r = await call(authed('/__probe'));
+    const j = await r.json();
+    ok('/__probe 上游 403 视为连通（ok:true / HTTP 200）',
+      r.status === 200 && j.ok === true && j.status === 403);
+  }
+  {
+    mode = 'up-fail';
+    const r = await call(authed('/__probe'));
+    const j = await r.json();
+    ok('/__probe 上游断连 → 502 且带 errorKind',
+      r.status === 502 && j.ok === false && !!j.errorKind, JSON.stringify(j).slice(0, 120));
+  }
+
+  /* ---------- 4) 陪护判据：只看上游腿 ---------- */
+  {
+    mode = 'ok';
+    const r = await call(authed('/__guard'));
+    const j = await r.json();
+    ok('/__guard 两侧通 → ok / verdict=ok / HTTP 200',
+      r.status === 200 && j.ok === true && j.verdict === 'ok' && j.siteOk === true);
+  }
+  {
+    mode = 'site-hang';
+    const r = await call(authed('/__guard'));
+    const j = await r.json();
+    ok('站点腿超时但上游通 → 仍 ok:true / HTTP 200（v4 核心修复）',
+      r.status === 200 && j.ok === true && j.channelOk === true && j.siteOk === false,
+      'status=' + r.status + ' verdict=' + j.verdict);
+    ok('站点腿超时 → verdict=channel-ok-site-slow',
+      j.verdict === 'channel-ok-site-slow', String(j.verdict));
+  }
+  {
+    mode = 'up-fail';
+    const r = await call(authed('/__guard'));
+    const j = await r.json();
+    ok('上游断连 → ok:false / HTTP 502 / verdict=upstream-down',
+      r.status === 502 && j.ok === false && j.verdict === 'upstream-down');
+  }
+
+  /* ---------- 5) 转发：原样透传 + 私有信息剥离 ---------- */
+  {
+    mode = 'ok';
+    seen.length = 0;
+    const r = await call(authed('/gtw-ai/api/sms/send?foo=1&key=' + KEY + '&relay_secret=x', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-relay-host': '5gvas01.cmicmaap.com' },
+      body: 'phone=13800000000&text=hi',
+    }));
+    const up = seen.find((s) => s.url.includes('5gvas01'));
+    ok('转发命中上游且状态码透传', !!up && r.status === 403);
+    ok('path 原样保留', !!up && up.url.startsWith('https://5gvas01.cmicmaap.com/gtw-ai/api/sms/send'));
+    ok('业务 query 保留（foo=1）', !!up && up.url.includes('foo=1'));
+    ok('私有 query 剥离（key / relay_secret 不带给网关）',
+      !!up && !up.url.includes('key=') && !up.url.includes('relay_secret'));
+    ok('method 与 body 透传', !!up && up.method === 'POST' && up.body === 'phone=13800000000&text=hi');
+    ok('私有头剥离（x-relay-secret 不出网）',
+      !!up && !up.headers['x-relay-secret'] && !up.headers['x-relay-host']);
+    ok('content-type 保留', !!up && up.headers['content-type'] === 'application/x-www-form-urlencoded');
+    ok('响应带版本与分段耗时头',
+      r.headers.get('x-relay-ver') === 'relay-v4' &&
+      r.headers.get('x-relay-upstream-ms') !== null &&
+      r.headers.get('x-relay-by') === 'tester');
+  }
+  {
+    mode = 'fwd-hang';
+    const r = await call(authed('/gtw-ai/api/sms/send', { method: 'POST', body: 'x=1' }));
+    const j = await r.json();
+    ok('转发超时 → 504 且标 timeout',
+      r.status === 504 && j.errorKind === 'timeout', 'status=' + r.status + ' kind=' + j.errorKind);
+  }
+  {
+    mode = 'up-fail';
+    const r = await call(authed('/gtw-ai/api/sms/send', { method: 'POST', body: 'x=1' }));
+    const j = await r.json();
+    ok('转发网络错 → 502（不是 504）', r.status === 502 && j.ok === false);
+  }
+
+  /* ---------- 6) 日志不落敏感内容 ---------- */
+  {
+    logBuf.length = 0;
+    mode = 'ok';
+    await call(authed('/gtw-ai/api/sms/send', { method: 'POST', body: 'phone=13800000000' }));
+    const joined = logBuf.join('\n');
+    ok('日志只记元数据：不含号码 / 密钥', !joined.includes('13800000000') && !joined.includes(KEY),
+      joined.slice(0, 160));
+    ok('日志含 kind 与耗时', /"kind":"forward"/.test(joined) && /"ms":/.test(joined));
+  }
+
+  out('\n────────────────────────────────');
+  if (FAIL) {
+    out('失败 ' + FAIL + ' 项 / 通过 ' + PASS + ' 项');
+    process.exit(1);
+  }
+  out('全部通过：' + PASS + ' 项（中继源码直载）');
+})().catch((e) => {
+  console.error('用例崩溃：', e && e.stack || e);
+  process.exit(1);
+});

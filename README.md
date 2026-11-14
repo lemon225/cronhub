@@ -4,10 +4,11 @@
 
 > **配套文档**
 > - 短信通路 / Cloudflare 中继 / 双向陪护 / 部署与排障 → [`docs/RELAY.md`](docs/RELAY.md)
+> - 短信链路技术档案：根因证据链 / 超时预算 / 判据语义 / 实测基线 / 已知限制 → [`docs/SMS-CHAIN.md`](docs/SMS-CHAIN.md)
 > - 逐批改动与构建号对照 → [`docs/CHANGELOG.md`](docs/CHANGELOG.md)
-> - 中继源码（Pages `_worker.js` + Workers 定时陪护）→ `relay/`
+> - 中继源码（Pages `_worker.js` + Workers 定时陪护）→ `relay/`；可复跑用例 → `tests/`（`npm test`）
 >
-> 短信经 `https://cronhub-sms-relay.pages.dev` 中转，该中继是**唯一短信出口**；网站与 Cloudflare 每 30 分钟互相唤醒/体检。改动中继代码请务必先读 `docs/RELAY.md` 的「已否证路线」与「部署流程」。
+> 短信经 `https://cronhub-sms-relay.pages.dev` 中转，该中继是**唯一短信出口**；网站与 Cloudflare 每 30 分钟互相唤醒/体检。改动中继代码请务必先读 `docs/RELAY.md` 的「已否证路线」与「部署流程」，结论性判据以 `docs/SMS-CHAIN.md` 为准。
 
 ## 启动
 
