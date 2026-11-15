@@ -477,8 +477,8 @@ function renderStats() {
   // 每张统计卡都可点击，直接跳到对应视图看明细
   const cards = [
     { view: 'tasks', label: '活跃任务', icon: ICONS.zap, value: enabled, unit: '个', foot: tasks.length ? `共 ${tasks.length} 个任务，${enabled === tasks.length ? '全部启用' : (tasks.length - enabled) + ' 个已暂停'}` : '还没有任务' },
-    { act: 'tasklogs', label: '执行日志', icon: ICONS.clock, value: logs.length, unit: '条', foot: `今日 ${runsToday} 次${failures ? ` · 失败 ${failures} 次` : ''}` },
-    { view: 'logs', label: '失败次数', icon: ICONS.err, value: failures, unit: '次', foot: failures ? '建议检查失败任务' : '运行状况良好' },
+    { act: 'tasklogs', label: '执行日志', icon: ICONS.clock, value: logs.length, unit: '条', foot: `今日 ${runsToday} 次` },
+    { view: 'logs', label: '失败次数', icon: ICONS.err, value: failures, unit: '次', foot: failures ? `占 ${logs.length ? ((failures / logs.length) * 100).toFixed(1) : '0'}%` : '运行状况良好' },
   ];
 
   // 第 4 张：系统日志（后台运行数据），填满 4 列统计栏
@@ -2259,8 +2259,8 @@ function renderServerInfo(m) {
     const rows = [
       {
         s: curSec > 90 ? 'ok' : 'warn',
-        t: `运行中 · 已连续 ${fmtDur(curSec)}`,
-        n: `最长 ${fmtDur(rt.longestSec)} · 累计 ${fmtDur(rt.totalSec)} · 中断 ${rt.interruptions || 0} 次`,
+        t: `已连续运行 ${fmtDur(curSec)}`,
+        n: '',   // 最长 / 累计 / 中断在「长期运行」卡里有独立一行，这里不再重复一遍
       },
       {
         s: m.storageWritable === false ? 'err' : 'ok',
@@ -2270,7 +2270,7 @@ function renderServerInfo(m) {
       {
         s: m.authEnabled ? 'ok' : 'warn',
         t: m.authEnabled ? '访问控制：密码访问' : '访问控制：开放访问',
-        n: m.authEnabled ? '仅持密码者可修改' : '任何拿到链接的人都能改任务',
+        n: '',   // 后果与改法在「安全与数据」的访问控制卡里说，这里只留状态
       },
       {
         s: errCount ? 'err' : 'ok',
@@ -2307,11 +2307,8 @@ function renderServerInfo(m) {
     const c = meta.counts || {};
     const err = c.error || 0;
     const warn = c.warn || 0;
-    const parts = [`共 ${meta.total || 0} 条`];
-    if (err) parts.push(`${err} 条错误`);
-    if (warn) parts.push(`${warn} 条警告`);
-    if (S.sysInfo && S.sysInfo.curText) parts.push(`已运行 ${S.sysInfo.curText}`);
-    logsHint.textContent = parts.join(' · ');
+    // 卡头只报「跑了多久」：错误 / 警告 / 总量在下面三行已经分行列出
+    logsHint.textContent = (S.sysInfo && S.sysInfo.curText) ? `已运行 ${S.sysInfo.curText}` : '';
     logsHint.className = err ? 'hint hint--warn' : 'hint';
   }
 
@@ -2448,7 +2445,7 @@ function renderKeepView() {
       state: !self.enabled ? 'off' : self.lastOk === false ? 'err' : self.lastOk === true ? 'ok' : 'warn',
       value: !self.enabled ? '未启用' : self.lastOk === false ? '探测失败' : self.lastOk === true ? '正常' : '待探测',
       note: self.enabled
-        ? `每 ${self.everyMin || 10} 分钟 · 已探 ${self.hits || 0} 次${self.nextAt ? ` · 下次 ${new Date(self.nextAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''}`
+        ? `每 ${self.everyMin || 10} 分钟${self.nextAt ? ` · 下次 ${new Date(self.nextAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''}`
         : '没有持续流量，平台会判空闲休眠',
     },
     {
@@ -2506,16 +2503,16 @@ function renderKeepView() {
   }
   const d1 = $('#kw1Detail');
   if (d1) {
-    if (!self.enabled) d1.textContent = '开启后服务端每 N 分钟访问一次自己的公网地址，让平台持续看到流量。注意：这个托管环境按请求拉起容器、空闲约 1 分钟就停，进程里的定时器常常等不到下一轮 —— 它能减少空档，但要彻底不断，还得配下面的外部定时器。';
+    if (!self.enabled) d1.textContent = '开启后服务端每 N 分钟访问一次自己的公网地址。进程内定时器撑不过空闲休眠，要彻底不断还得配下面的外部唤醒。';
     else if (self.lastAt) d1.textContent = `最近一次：${new Date(self.lastAt).toLocaleString('zh-CN', { hour12: false })} · ${self.lastMsg || '—'}` + (self.nextAt ? `　下次：${new Date(self.nextAt).toLocaleTimeString('zh-CN', { hour12: false })}` : '');
     else d1.textContent = '已开启，正在等待首次探测结果…';
   }
   const note = $('#kwStateNote');
   if (note) {
+    // 开关状态、间隔、状态标签已经把「现在是什么」说完了，这行只留预警和漏配提示
     note.textContent = self.enabled
-      ? `当前：自探活开启，每 ${Math.min(60, Math.max(1, Number(self.everyMin) || 2))} 分钟一次；地址由当前访问域名自动生成，换了域名重新保存即可。`
-        + (Number(self.everyMin) > 2 ? `　⚠ 托管环境空闲约 1 分钟就停容器，间隔大于 2 分钟时两次探活之间仍会断，建议改成 1 分钟。` : '')
-      : '当前：自探活未开启。保险二（外部唤醒）仍可单独使用 —— 只在需要时叫醒实例，其余时间照常休眠省资源。';
+      ? (Number(self.everyMin) > 2 ? '⚠ 间隔大于 2 分钟时两次探活之间仍会断（空闲约 1 分钟就停容器），建议改成 1 分钟。' : '')
+      : '未开启不影响保险二：外部唤醒只在需要时叫醒实例，其余时间照常休眠省资源。';
   }
 
   // 保险二
@@ -2527,8 +2524,8 @@ function renderKeepView() {
   const wStats = $('#wakeStats');
   if (wStats) {
     wStats.textContent = wake.count
-      ? `最近一次唤醒：${new Date(wake.lastAt).toLocaleString('zh-CN', { hour12: false })}（累计 ${wake.count} 次）`
-      : '还没有外部请求打过这个地址 —— 建议现在就去 cron-job.org 建一个 5 分钟间隔的监控，这一步做完才算真正防休眠。';
+      ? `最近一次唤醒：${new Date(wake.lastAt).toLocaleString('zh-CN', { hour12: false })}`
+      : '还没有外部请求打过这个地址 —— 去 cron-job.org 建一个 1 分钟间隔的监控，才算真正防休眠。';
   }
 
   // 保险三
@@ -2539,7 +2536,7 @@ function renderKeepView() {
   }
   const d3 = $('#kwPageDetail');
   if (d3) {
-    d3.textContent = `页面开着时每 ${page.beatSec || 30} 秒打一次健康检查；切到后台或关页面自动停。人在电脑前时的第三道兜底，不占额外服务端资源。`;
+    d3.textContent = `切到后台或关页面自动停；不占服务端资源。`;
   }
 
   renderKeepLog(k && k.log);
@@ -2898,13 +2895,15 @@ async function load(showErr = false) {
 
 /* ------------------------------------------------------------ 视图切换 */
 
+/* 顶栏副标题只在这里写一次：能由页面自己说清的一律留空（统计卡、分组标题、
+ *  三道保险的编号卡、设置页的四个分段标题本身就是目录），不重复讲一遍布局。 */
 const VIEW_META = {
-  overview: ['总览', '实时掌握所有定时任务的运行状态'],
-  tasks: ['任务', '管理定时任务与提醒，关掉页面也会照常执行'],
-  inbox: ['通知', '所有提醒与告警的收件箱'],
-  logs: ['系统日志', '后台运行数据 · 启动 / 休眠唤醒 / 内存 / 接口 / 调度 / 任务流水'],
-  keep: ['保活控制台', '三道保险集中管理：自探活、外部唤醒、页面心跳'],
-  settings: ['设置', '配置推送通道与运行环境'],
+  overview: ['总览', ''],
+  tasks: ['任务', '服务端执行，关掉页面也会照常跑'],
+  inbox: ['通知', ''],
+  logs: ['系统日志', ''],
+  keep: ['保活控制台', ''],
+  settings: ['设置', ''],
 };
 
 /** 不在左侧导航里的页面：只能从设置页的按钮进入，进入后顶栏出现「返回设置」。 */
@@ -2925,7 +2924,9 @@ function switchView(view) {
   if (back) back.hidden = !HIDDEN_VIEWS.includes(view);
   const [title, sub] = VIEW_META[view] || ['', ''];
   $('#viewTitle').textContent = title;
-  $('#viewSub').textContent = sub;
+  const subEl = $('#viewSub');
+  subEl.textContent = sub;
+  subEl.hidden = !sub;   // 空副标题不留一块空行，标题与内容直接相邻
   if (view === 'settings') smtpHydrated = false;
   if (view === 'keep') refreshKeep();
   renderAll();
