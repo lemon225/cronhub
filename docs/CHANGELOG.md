@@ -6,6 +6,29 @@
 
 ---
 
+## 2026-11-15 · 第二十三批（源码就绪，未上线）· 变量加工与通用脚本云函数 · `cloudfn-v1`
+
+**需求**：在环境变量之上做变量加工，定义「今天算明天并调整格式」这类派生量（如 `tomorrowtime`），并形成通用编写方案，方便 AI 直接产出脚本。
+
+**关键判据**：`server.js` 的 `applyEnvVars()` 只替换 `{{纯单词}}`，且未定义时原样保留。因此含管道、空格、引号的表达式会原样透传到云函数，**站点与线上任务配置都不用改**。
+
+**交付**（全部在 `cloudfn/`，`server.js` / `public/` 零改动）
+- `_worker.js`：可抽取测试的纯函数引擎区间、内置源与 16 个内置函数、脚本白名单注册表（`vars-echo` / `proxy` / `aggregate-json`）、`x-script-secret` 鉴权、`/__health`、`/v1/<name>` 路由、统一结构化响应（失败 500，让 CronHub 的 `expectStatus:200` 触发告警）。
+- `SPEC.md`：给 AI 的唯一契约 —— 双花括号管道语法、派生变量、固定 UTC+8（禁 `toISOString`）、`run(ctx)` 模板、请求/响应 JSON、安全边界、部署命令、自检清单、交付三件套。
+- `examples.js`：日期加工、代理转发任务配置、多接口聚合、自定义脚本与自定义函数五个可复制片段。
+- `tests/cloudfn.test.cjs`：30 项，含「站点正则不误伤表达式」与「`{{tomorrowtime}}` 原样透传」两条零改站判据。
+- `index.html`：Pages 项目静态占位。
+
+**语法示例**：`"tomorrowtime": { "expr": "now | addDays(1) | format('YYYY-MM-DD 08:00:00')" }`，任务里只写 `{{tomorrowtime}}`。单花括号会和 JSON 的 `{}` 撞车，不用。
+
+**安全取舍**：独立 Pages 项目、脚本必须是源码白名单项、禁止 `eval` / KV 动态加载（那等于远程代码执行通道，需单独授权）、绝不碰 `cronhub-sms-relay`、不在 CF 给同一脚本再挂 Cron、密钥不进响应。
+
+**验证**：`node --check`（Worker ESM 与 CJS 均通过）；`npm test` 12 个文件全通（首次 `watchdog.test.cjs` 偶发失败一次，单独跑与复跑全量均通过，属既有端口时序抖动）；真实 HTTP 冒烟 5 项 PASS（`/__health`、派生变量、敏感键打码、`proxy` 转发后 `d=2026-11-16`、错误密钥 403）。
+
+**状态**：**未部署、未新建 CF 项目、未改线上任务配置**；线上仍是 `audit-batch-22e`。待授权：① 新建 Cloudflare Pages 项目 `cronhub-scripts` 并部署；② 首个试点脚本；③ 是否做 KV 动态脚本（默认不做）。
+
+---
+
 ## 2026-11-15 · 第二十二批收尾 · 图标唯一性与原文可复核 · `audit-batch-22e`
 
 **问题**：① 提示词写了「图标全篇不重复」，但那只是软约束，模型常三行都用 ❄️；② 通知详情「看 AI 前的原文」只存 `实况：HTTP 200…` 这类状态串，看不到 AI 抄的温度对不对。
