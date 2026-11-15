@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-26b';
+const SMS_BUILD = 'audit-batch-26f';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2661,6 +2661,9 @@ function aiRules(text) {
   // 其它任务（油价、热评、自检）的提示词不含这四个字，完全不受影响。
   if (/事实结论/.test(t)) {
     rules.push({ kind: 'fact-source', hard: true, label: '天气词 / 时段 / 预警出自结论区' });
+    // 现象词对得上，不代表时刻对得上：「今晚18时起，22时停」里没有一个天气词
+    // 是编的，时刻却全是编的。起止改由结论区唯一的逐小时区间卡死。
+    rules.push({ kind: 'fact-band', hard: true, label: '降水起止与结论区一致' });
   }
   return rules;
 }
@@ -2704,6 +2707,19 @@ function dedupeIcons(text, pool) {
     }
     seen.add(aiIconKey(icon));
     return m[1] + icon + m[3] + m[4];
+  }).join('\n');
+}
+
+/**
+ * 「❄️ 19-07时今晚小雪」→「❄️ 今晚19-07时小雪」：时段固定跟在「今晚」「明天」后面。
+ * 提示词里写了顺序，模型仍会把时段提到行首（实测 11-15 20:31 那次）。
+ * 这属于纯排版，改一下就能读通，不必为它再花一次模型调用去纠正。
+ */
+function orderBandAfterDay(text) {
+  return String(text || '').split('\n').map((l) => {
+    const m = l.match(/^(\s*\S+\s+)(\d{1,2}(?:[-–]\d{1,2})?时)(今晚|明天|今天|明日|明早)(\S.*)?$/);
+    if (!m) return l;
+    return m[1] + m[3] + m[2] + (m[4] || '');
   }).join('\n');
 }
 
@@ -2752,6 +2768,38 @@ function aiReview(body, rules, factText) {
         ])];
         if (missing.length) add(`出现事实结论区没有的内容「${missing.slice(0, 3).join('、')}」`, r.hard);
       }
+    } else if (r.kind === 'fact-band') {
+      /*
+       * 只查「写的时刻是不是结论区那个时段里的」，不查「有没有写时段」——
+       * 后者正是要允许的「取不到就不写」。时段优先抄整段 `19-07时`；
+       * 只写起点 `19时` 也认（那是区间的头，不是编出来的数），
+       * 唯一硬线是：区间外的小时一个都不能出现，结论区没降水就不能写时刻。
+       */
+      const ft = String(factText || '');
+      if (!/【事实结论/.test(ft)) continue;
+      // 「18-22时」只有末尾带「时」，前半段要靠区间正则单独抓，
+      // 否则起始时刻永远不在抽查范围里（18 时就是这么混过去的）。
+      const used = [...new Set([
+        ...[...text.matchAll(/(\d{1,2})\s*[-–~至到]\s*(\d{1,2})时/g)]
+          .flatMap((m) => [Number(m[1]), Number(m[2])]),
+        ...[...text.matchAll(/(\d{1,2})时/g)].map((m) => Number(m[1])),
+      ])];
+      if (!used.length) continue;
+      const m = ft.match(/降水区间=(\d{1,2})(?:-(\d{1,2}))?时/);
+      if (!m) {
+        add('结论区没有降水，正文却写了降水时刻', r.hard);
+        continue;
+      }
+      const a = Number(m[1]);
+      const b = m[2] == null ? a : Number(m[2]);
+      const allow = new Set();
+      if (a <= b) for (let h = a; h <= b; h++) allow.add(h);
+      else {
+        for (let h = a; h <= 23; h++) allow.add(h);
+        for (let h = 0; h <= b; h++) allow.add(h);
+      }
+      const missing = used.filter((h) => !allow.has(h));
+      if (missing.length) add(`降水时刻「${missing.join('、')}时」不在结论区区间内`, r.hard);
     } else if (r.kind === 'no-markdown') {
       // 只认真正的标记：**加粗**、反引号、表格竖线、行首「- 」/「# 」。行首「-3.6」
       // 是负号不是列表，所以要求破折号后面跟空格。
@@ -2903,6 +2951,7 @@ async function aiPolish(cfg, opts) {
     let bodyText = String(parsed.body || '').replace(/\\n/g, '\n');
     if (tightUnits) bodyText = bodyText.replace(/(\d)\s+(°C)/g, '$1$2');
     if (needUniqueIcons) bodyText = dedupeIcons(bodyText, iconPool);
+    bodyText = orderBandAfterDay(bodyText);
     return { title: String(parsed.title).slice(0, 40), body: clipBody(bodyText) };
   };
 
@@ -4680,6 +4729,13 @@ function qwSpan(start, end) {
   return a && b ? `${a}-${b}时` : '';
 }
 
+/*
+ * 降水时段只用 24 小时制区间：「19-07时」、分段就写「19-22时」。
+ * 一度改成「今晚19时起，明早7时停」，实测读起来更绕、字数也多一倍：24 小时制
+ * 本身就没有歧义，19-07 一眼就是晚上七点到次日七点。所以区间由 qwSpan 一次
+ * 拼好，模型原样抄，不做换算、不加「起」「停」。
+ */
+
 function summarizeQWeatherStep(j) {
   const lines = [];
   const n1 = (v, unit = '') => (v == null || v === '' ? '' : `${Math.round(Number(v) * 10) / 10}${unit}`);
@@ -4803,18 +4859,25 @@ function qWeatherFacts(steps) {
   const d0 = days[0] || {}, d1 = days[1] || {};
   const tonight = d0.nighttime || {}, tomorrow = d1.daytime || {}, tomorrowNight = d1.nighttime || {};
 
+  // 逐日 / 逐小时的时间都带日期，取日期只用于定位「今晚」「明天」两行。
+  const ymd = (o) => String((o && o.forecastStartTime) || '').slice(0, 10);
+  const d0date = ymd(d0), d1date = ymd(d1);
+
   // 降水区间：逐小时只认现象文本里明确写了雨/雪的小时。
   // 不能用 amount>0 兜：和风 v1 会把逐日白天的雪量挂到某一小时，那条记录的
   // condition 却是「中度霾」（11-15 实测算出「11-11时」）。没有明确雨雪现象时
   // 一律退逐日的白天/夜间时段，那边有 forecastStartTime/EndTime，更可信。
   const wet = hours.filter((h) => /[雨雪]/.test(cond(h)));
-  let band = '', bandSrc = '', bandText = '';
+  let band = '', bandSrc = '', bandText = '', startAt = '';
   if (wet.length) {
-    const hh = (h) => String(h.forecastTime || '').slice(11, 13);
-    const first = hh(wet[0]), last = hh(wet[wet.length - 1]);
-    band = first === last ? `${first}时` : `${first}-${last}时`;
+    const first = wet[0], last = wet[wet.length - 1];
+    const sIso = String(first.forecastTime || '');
+    const eIso = String(last.forecastTime || '');
+    const hh = (s) => s.slice(11, 13);
+    band = hh(sIso) === hh(eIso) ? `${hh(sIso)}时` : `${hh(sIso)}-${hh(eIso)}时`;
     bandSrc = '逐小时';
-    bandText = cond(wet.find((h) => /雪/.test(cond(h))) || wet.find((h) => /雨/.test(cond(h))) || wet[0]);
+    bandText = cond(wet.find((h) => /雪/.test(cond(h))) || wet.find((h) => /雨/.test(cond(h))) || first);
+    startAt = sIso;
   } else {
     const cands = [
       { part: tonight, label: '今晚夜间' },
@@ -4832,23 +4895,20 @@ function qWeatherFacts(steps) {
       break;
     }
   }
-
-  // 降水区间归属到「今晚」还是「明天」：只给一个总区间时，模型会把它同时
+  // 降水时段归属到「今晚」还是「明天」：只给一个总区间时，模型会把它同时
   // 套进两行（实测今晚也写了 19-07时），多出的 6 字又把 58 字上限挤爆，
   // 于是「黄色」时有时无 —— 剩下这点摇摆全来自这里。
-  const d0date = String(d0.forecastStartTime || '').slice(0, 10);
-  const d1date = String(d1.forecastStartTime || '').slice(0, 10);
-  let tonightBand = '无', tomorrowBand = '无';
+  let bandSide = '';
   if (band) {
-    if (bandSrc.startsWith('明天')) tomorrowBand = band;
-    else if (bandSrc.startsWith('今晚')) tonightBand = band;
+    if (bandSrc.startsWith('明天')) bandSide = 'tomorrow';
+    else if (bandSrc.startsWith('今晚')) bandSide = 'tonight';
     else {
-      const t0 = String((wet[0] && wet[0].forecastTime) || '');
-      const fd = t0.slice(0, 10), hh = Number(t0.slice(11, 13));
-      if ((fd === d0date && hh >= 19) || (fd === d1date && hh <= 7)) tonightBand = band;
-      else tomorrowBand = band;
+      const fd = startAt.slice(0, 10), hh = Number(startAt.slice(11, 13));
+      bandSide = ((fd === d0date && hh >= 19) || (fd === d1date && hh <= 7)) ? 'tonight' : 'tomorrow';
     }
   }
+  // 每行只给本行这一个时段，另一行写「无」——两行都不借对方的时段。
+  const bandOf = (side) => (band && bandSide === side ? band : '无');
 
   const LV = { yellow: '黄色', orange: '橙色', red: '红色', blue: '蓝色' };
   const a0 = alerts[0];
@@ -4858,8 +4918,10 @@ function qWeatherFacts(steps) {
     : '无';
 
   const lines = ['【事实结论｜优先直接引用，禁止自行扫描或推算】'];
-  lines.push(`今晚 日期=${d0date} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 时段=${qwSpan(tonight.forecastStartTime, tonight.forecastEndTime)} 降水时段=${tonightBand}`);
-  lines.push(`明天 日期=${d1date} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 时段=${qwSpan(tomorrow.forecastStartTime, tomorrow.forecastEndTime)} 降水时段=${tomorrowBand}`);
+  lines.push(`今晚 日期=${d0date} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 昼夜=${qwSpan(tonight.forecastStartTime, tonight.forecastEndTime)} 降水=${bandOf('tonight')}`);
+  lines.push(`明天 日期=${d1date} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 昼夜=${qwSpan(tomorrow.forecastStartTime, tomorrow.forecastEndTime)} 降水=${bandOf('tomorrow')}`);
+  // 时段就给这一串，模型原样拼在现象前面：`19-07时`。不给「今晚19时／明早7时」
+  // 这种还得再加工的原子 —— 每加工一次，就多一次改编的机会。
   lines.push(`降水区间=${band || '无'} 来源=${bandSrc || '无降水'} 类型=${bandText || '无'}`);
   lines.push(a0
     ? `预警名=${warnName} 级别=${lvCode} 摘要=${String(a0.headline || '').slice(0, 30)}`
@@ -6382,26 +6444,38 @@ function sendJSON(res, code, data) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let raw = '';
+    /*
+     * 先收字节、最后一次性解码。
+     *
+     * 原先 `raw += c`（c 是 Buffer）会逐块调 toString()，多字节中文正好跨在
+     * 两个块中间时被切成半个字符 —— 实测 2.3KB 的天气提示词里「，」变成了
+     * 「\uFFFD\uFFFD\uFFFD」存进库，前端看不出来、AI 读到的却是坏字。
+     * Buffer.concat 之后只解码一次，边界交给解码器处理。
+     */
+    const chunks = [];
     let size = 0;
+    let settled = false;
     req.on('data', (c) => {
+      if (settled) return;
       size += c.length;
       if (size > 1024 * 1024) {
+        settled = true;
         reject(new Error('请求体过大'));
         req.destroy();
         return;
       }
-      raw += c;
+      chunks.push(c);
     });
     req.on('end', () => {
-      if (!raw) return resolve({});
+      if (settled) return;
+      if (!size) return resolve({});
       try {
-        resolve(JSON.parse(raw));
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
       } catch {
         reject(new Error('请求体不是合法 JSON'));
       }
     });
-    req.on('error', reject);
+    req.on('error', (e) => { if (!settled) { settled = true; reject(e); } });
   });
 }
 

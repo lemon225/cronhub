@@ -44,7 +44,7 @@ function pure(blockStart, blockEnd, prefix, names) {
 const W = pure('function qwSpan(', '/**\n * 生成推送内容',
   'const RESULT_BODY_MAX=200000;', ['qwSpan', 'summarizeQWeatherStep', 'qWeatherFacts', 'summarizeStepData']);
 const A = pure('function aiRules(', '/**\n * 拼装提示词', '',
-  ['aiRules', 'aiReview', 'aiIconPool', 'dedupeIcons', 'aiFabricationViolations']);
+  ['aiRules', 'aiReview', 'aiIconPool', 'dedupeIcons', 'aiFabricationViolations', 'orderBandAfterDay']);
 
 function hour(day, h, text, precip) {
   return {
@@ -126,9 +126,11 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   ok('预警名直接给中文全名，不用模型自己翻译 yellow',
     facts.some((l) => l.includes('预警名=道路结冰黄色预警'))
     && facts.some((l) => l.includes('AQI=43')));
-  ok('降水时段按今晚 / 明天分开，今晚不再被套上明天的时段',
-    facts.some((l) => l.startsWith('今晚 ') && l.includes('降水时段=无'))
-    && facts.some((l) => l.startsWith('明天 ') && l.includes('降水时段=07-19时')));
+  ok('降水按今晚 / 明天分开，今晚不再被套上明天的时段',
+    facts.some((l) => l.startsWith('今晚 ') && l.includes('降水=无'))
+    && facts.some((l) => l.startsWith('明天 ') && l.includes('降水=07-19时')));
+  ok('行内直接给整段 24 小时制区间，不再给起止原子',
+    !facts.some((l) => /起=|止=|写法=|开始=|结束=|粒度=/.test(l)));
 
   console.log('\n[3] 降水区间：逐小时优先、跨午夜连写、无降水写「无」');
   const wetHours = Array.from({ length: 24 }, (_, i) => {
@@ -140,9 +142,21 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   const wetFacts = W.qWeatherFacts(stepsOf(qwFixture({ hours: wetHours }), NAMES));
   ok('逐小时扫出 22-03时，不拆段不写两个「时」',
     wetFacts.some((l) => l.includes('降水区间=22-03时') && l.includes('来源=逐小时')), wetFacts);
+  ok('今晚行拿到整段 22-03时，跨午夜不加日期词',
+    wetFacts.some((l) => l.startsWith('今晚 ') && l.includes('降水=22-03时')), wetFacts);
+  ok('时段只在「降水区间」出现一次，不再给开始 / 结束 / 写法三份',
+    wetFacts.filter((l) => l.startsWith('降水区间=')).length === 1
+    && !wetFacts.some((l) => /开始=|结束=|写法=/.test(l)), wetFacts);
+  const sameDayFixture = qwFixture();
+  sameDayFixture.hourly.hours[21] = hour(16, 8, '中雪', 0.5);
+  sameDayFixture.hourly.hours[22] = hour(16, 9, '中雪', 0.5);
+  sameDayFixture.hourly.hours[23] = hour(16, 10, '小雪', 0.5);
+  const sameDayFacts = W.qWeatherFacts(stepsOf(sameDayFixture, NAMES));
+  ok('同一天内的降水写成 08-10时，不重复日期词',
+    sameDayFacts.some((l) => l.startsWith('明天 ') && l.includes('降水=08-10时')), sameDayFacts);
   ok('跨午夜降水归今晚，不误挂到明天',
-    wetFacts.some((l) => l.startsWith('今晚 ') && l.includes('降水时段=22-03时'))
-    && wetFacts.some((l) => l.startsWith('明天 ') && l.includes('降水时段=无')), wetFacts);
+    wetFacts.some((l) => l.startsWith('今晚 ') && l.includes('降水=22-03时'))
+    && wetFacts.some((l) => l.startsWith('明天 ') && l.includes('降水=无')), wetFacts);
   // 和风 v1 把逐日白天的雪量挂到一条「中度霾」小时上：只看 amount>0 会算出 11-11时。
   const misleading = qwFixture();
   misleading.hourly.hours[23] = {
@@ -192,11 +206,21 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   ok('只有写了「事实结论」的任务才启用 fact-source',
     rSrc.some((r) => r.kind === 'fact-source' && r.hard)
       && !A.aiRules('正文 ≤58 字').some((r) => r.kind === 'fact-source'), rSrc);
-  const srcFacts = '【事实结论｜优先直接引用】\n今晚 现象=多云 最低=-1.5°C 降水时段=无\n'
-    + '明天 现象=小雪 最低=-1.5°C 最高=6.3°C 降水时段=07-19时\n预警名=道路结冰黄色预警';
+  const srcFacts = '【事实结论｜优先直接引用】\n今晚 现象=多云 最低=-1.5°C 降水=无\n'
+    + '明天 现象=小雪 最低=-1.5°C 最高=6.3°C 降水=19-02时\n'
+    + '降水区间=19-02时 来源=逐小时 类型=小雪\n'
+    + '预警名=道路结冰黄色预警';
   ok('逐字引用结论区零违规',
-    A.aiReview('❄️ 今晚多云，最低-1.5°C\n⛅ 明天07-19时小雪，-1.5°C~6.3°C\n'
-      + '⚠️ 道路结冰黄色预警；明早慢行', rSrc, srcFacts).length === 0);
+    A.aiReview('❄️ 今晚多云，最低-1.5°C\n⛅ 明天19-02时小雪，-1.5°C~6.3°C\n'
+      + '⚠️ 道路结冰黄色预警；明早慢行', rSrc, srcFacts).length === 0,
+    A.aiReview('❄️ 今晚多云，最低-1.5°C\n⛅ 明天19-02时小雪，-1.5°C~6.3°C\n'
+      + '⚠️ 道路结冰黄色预警；明早慢行', rSrc, srcFacts));
+  ok('时段起头不在结论区区间内被硬拦',
+    A.aiReview('❄️ 今晚18时小雪\n⛅ 明天02时小雪\n🧣 明早慢行', rSrc, srcFacts)
+      .some((v) => v.hard && v.msg.includes('不在结论区区间内')));
+  ok('照抄区间外的旧写法 18-22时 同样被拦',
+    A.aiReview('❄️ 今晚18-22时小雪\n⛅ 明天中雪\n🧣 明早慢行', rSrc, srcFacts)
+      .some((v) => v.hard && v.msg.includes('不在结论区区间内')));
   const fakeWeather = A.aiReview(
     '❄️ 今晚18-22时雨夹雪\n⛅ 明天05-19时雪\n⚠️ 道路结冰橙色预警；明早慢行', rSrc, srcFacts);
   ok('编造时段 / 现象 / 预警级别被标为 hard',
@@ -214,8 +238,25 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
       && A.aiFabricationViolations([]).length === 0, fakeWeather);
   ok('合规结果不会被误判为编造',
     A.aiFabricationViolations(A.aiReview(
-      '❄️ 今晚多云，最低-1.5°C\n⛅ 明天07-19时小雪，-1.5°C~6.3°C\n'
+      '❄️ 今晚多云，最低-1.5°C\n⛅ 明天19-02时小雪，-1.5°C~6.3°C\n'
       + '⚠️ 道路结冰黄色预警；明早慢行', rSrc, srcFacts)).length === 0);
+  ok('事实结论任务同时启用时段校验', rSrc.some((r) => r.kind === 'fact-band' && r.hard));
+  // 逐日退回只有 07-19 这种昼夜区间：照抄整段可以，抄区间外的小时不行。
+  const dayFacts = '【事实结论】\n今晚 现象=多云 最低=-1.5°C 降水=无\n'
+    + '明天 现象=小雪 最低=-1.5°C 最高=6.3°C 降水=07-19时\n'
+    + '降水区间=07-19时 来源=明天白天/逐日 类型=小雪';
+  ok('逐日区间照抄「07-19时」零违规',
+    A.aiReview('❄️ 今晚多云\n⛅ 明天07-19时小雪\n🧣 明早慢行', rSrc, dayFacts).length === 0,
+    A.aiReview('❄️ 今晚多云\n⛅ 明天07-19时小雪\n🧣 明早慢行', rSrc, dayFacts));
+  ok('只写区间起点「7时」也接受（次优，不算编造）',
+    A.aiReview('❄️ 今晚多云\n⛅ 明天7时小雪\n🧣 明早慢行', rSrc, dayFacts).length === 0);
+  ok('区间外的时刻仍被硬拦',
+    A.aiReview('❄️ 今晚多云\n⛅ 明天06-21时小雪\n🧣 明早慢行', rSrc, dayFacts)
+      .some((v) => v.hard && v.msg.includes('不在结论区区间内')));
+  ok('结论区没降水却写时刻被硬拦',
+    A.aiReview('❄️ 今晚多云\n⛅ 明天18时小雪\n🧣 明早慢行', rSrc,
+      '【事实结论】\n今晚 现象=多云 降水=无\n明天 现象=小雪 降水=无\n降水区间=无 来源=无降水 类型=无')
+      .some((v) => v.hard && v.msg.includes('没有降水')));
 
   console.log('\n[4b] 图标全篇不重复：机检留痕 + 服务端确定性归一');
   const iconPrompt = '只输出 3 行；正文 ≤58 字；图标全篇不重复。今晚行：❄️ 明天行：⛅ 建议行：🧣 预警 ⚠️';
@@ -233,6 +274,17 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   ok('归一后机检零违规', A.aiReview(fixed, rIcon, text).length === 0);
   ok('带 / 不带 VS16 视为同一图标', /⚠️ 一\n(?!⚠)/u.test(A.dedupeIcons('⚠️ 一\n⚠ 二', pool)));
 
+  console.log('\n[4c] 时段顺序归一：模型把时段提到行首时拉回「今晚 / 明天」后面');
+  ok('「19-07时今晚小雪」→「今晚19-07时小雪」',
+    A.orderBandAfterDay('❄️ 19-07时今晚小雪，最低-1.4°C') === '❄️ 今晚19-07时小雪，最低-1.4°C',
+    A.orderBandAfterDay('❄️ 19-07时今晚小雪，最低-1.4°C'));
+  ok('明天行同样处理，单点时刻也算',
+    A.orderBandAfterDay('⛅ 07-19时明天小雪\n🧣 明早慢行') === '⛅ 明天07-19时小雪\n🧣 明早慢行'
+    && A.orderBandAfterDay('⛅ 19时明天小雪') === '⛅ 明天19时小雪');
+  ok('顺序本来就对时一个字不动',
+    A.orderBandAfterDay('❄️ 今晚19-07时小雪，最低-1.4°C\n🧣 明早慢行')
+      === '❄️ 今晚19-07时小雪，最低-1.4°C\n🧣 明早慢行');
+
   console.log('\n[5] 端到端：真服务 + mock AI 抓请求体，验证 temperature 与纠正链路');
   const seen = [];
   const ai = http.createServer((req, res) => {
@@ -242,7 +294,9 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
       seen.push(raw);
       // 第 1 次编数字、第 2 次编天气词与时段，各触发一次纠正；第 3 次给合规版
       // （°C 前带空格、前两行图标重复），验证两处确定性归一。
-      const goodSpaced = '❄️ 今晚多云，最低-1.4 °C\n❄️ 明天07-19时小雪-1.9~5.7 °C\n⚠️ 道路结冰黄色预警；明早慢行';
+      // 逐日来源只给 07-19 这种昼夜区间，合规版原样抄整段；顺便把时段写在行首，
+      // 验证服务端会把它拉回「明天」后面。
+      const goodSpaced = '❄️ 今晚多云，最低-1.4 °C\n❄️ 07-19时明天小雪，-1.9~5.7 °C\n⚠️ 道路结冰黄色预警；明早慢行';
       const body = seen.length === 1
         ? '❄️ 今晚小雪，最低-9.9°C\n⛅ 明天晴间多云，-3.6~5.7°C'
         : seen.length === 2
@@ -335,9 +389,10 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
         ok('第二次纠正点名编造的天气内容',
           JSON.stringify(req3.messages).includes('事实结论区没有的内容'), JSON.stringify(req3.messages).slice(-500));
       }
+      const expectBody = '❄️ 今晚多云，最低-1.4°C\n⛅ 明天07-19时小雪，-1.9~5.7°C\n⚠️ 道路结冰黄色预警；明早慢行';
       ok('最终正文为纠正后的合规版本，°C 与重复图标都被确定性归一',
-        notes[0] && notes[0].body === good, notes[0] && notes[0].body);
-      ok('aiNote 显示 8 项校验', notes[0] && /已校验 8 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
+        notes[0] && notes[0].body === expectBody, notes[0] && notes[0].body);
+      ok('aiNote 显示 9 项校验', notes[0] && /已校验 9 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
       ok('通知原文附上 AI 依据的接口数据（事实结论 + 24 行 hourly）',
         notes[0] && /【AI 依据的接口数据】/.test(notes[0].rawBody || '')
           && /【事实结论/.test(notes[0].rawBody || '')
