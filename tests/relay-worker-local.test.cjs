@@ -72,6 +72,9 @@ globalThis.fetch = async (input, init = {}) => {
       throw e;
     }
     if (mode === 'fwd-hang') return hang(init);
+    if (mode === 'up-redirect') {
+      return new Response('', { status: 302, headers: { location: 'https://5gvas01.cmicmaap.com/new-entry' } });
+    }
     // 网关对裸探针的正常响应就是 403
     return new Response('{"code":403,"msg":"no auth"}', {
       status: 403,
@@ -103,7 +106,11 @@ function authed(p, opts = {}) {
   /* ---------- 1) 鉴权 ---------- */
   {
     const r = await call(req('/__status'));
-    ok('无密钥 → 403 forbidden', r.status === 403 && (await r.text()) === 'forbidden');
+    const j = await r.json();
+    // v5：拒绝响应也带版本与 JSON —— 线上第一步永远是「先确认跑的是哪一版」
+    ok('无密钥 → 403 且带 ver（v5 起是 JSON，不再裸文本）',
+      r.status === 403 && j.ok === false && j.error === 'forbidden' && j.ver === 'relay-v5',
+      'status=' + r.status + ' body=' + JSON.stringify(j).slice(0, 80));
   }
   {
     const r = await call(req('/__status?key=wrong'));
@@ -112,7 +119,7 @@ function authed(p, opts = {}) {
   {
     const r = await call(req('/__status?key=' + KEY));
     const j = await r.json();
-    ok('query 密钥可用（浏览器手测路径）', r.status === 200 && j.ver === 'relay-v4');
+    ok('query 密钥可用（浏览器手测路径）', r.status === 200 && j.ver === 'relay-v5');
   }
   {
     const r = await call(authed('/__status'));
@@ -207,7 +214,7 @@ function authed(p, opts = {}) {
       !!up && !up.headers['x-relay-secret'] && !up.headers['x-relay-host']);
     ok('content-type 保留', !!up && up.headers['content-type'] === 'application/x-www-form-urlencoded');
     ok('响应带版本与分段耗时头',
-      r.headers.get('x-relay-ver') === 'relay-v4' &&
+      r.headers.get('x-relay-ver') === 'relay-v5' &&
       r.headers.get('x-relay-upstream-ms') !== null &&
       r.headers.get('x-relay-by') === 'tester');
   }
@@ -234,6 +241,46 @@ function authed(p, opts = {}) {
     ok('日志只记元数据：不含号码 / 密钥', !joined.includes('13800000000') && !joined.includes(KEY),
       joined.slice(0, 160));
     ok('日志含 kind 与耗时', /"kind":"forward"/.test(joined) && /"ms":/.test(joined));
+  }
+
+  /* ---------- 7) v5：安全债可视化 / 唤醒节流 / 跳转标记 ---------- */
+  {
+    const r = await call(authed('/__status'));
+    const j = await r.json();
+    ok('/__status 标明密钥来源（env 优先）', j.keysSource === 'env:RELAY_KEYS', String(j.keysSource));
+    ok('变量齐备时 debt 为空', Array.isArray(j.debt) && j.debt.length === 0, JSON.stringify(j.debt));
+  }
+  {
+    // 只配密钥、不配唤醒与健康地址 → 两条硬编码债应该自报
+    const r = await call(authed('/__status'), { RELAY_KEYS: 'tester:' + KEY });
+    const j = await r.json();
+    ok('缺变量时 debt 自报内联凭据（不会静默）',
+      j.debt.includes('wake-token-inline') && j.debt.includes('site-health-sharecode-inline'),
+      JSON.stringify(j.debt));
+    ok('debt 只报类别、不含凭据值',
+      !JSON.stringify(j.debt).includes('wk_') && !JSON.stringify(j.debt).includes('sharecode='));
+  }
+  {
+    mode = 'ok';
+    const r1 = await call(authed('/__wake'));
+    const j1 = await r1.json();
+    ok('/__wake 首次正常执行', r1.status === 200 && j1.ok === true && !j1.throttled);
+    const r2 = await call(authed('/__wake'));
+    const j2 = await r2.json();
+    ok('/__wake 30 秒内再次调用 → 节流且回上次结果',
+      r2.status === 200 && j2.throttled === true && !!j2.last && j2.last.ok === true,
+      JSON.stringify(j2).slice(0, 120));
+    const r3 = await call(authed('/__wake?force=1'));
+    const j3 = await r3.json();
+    ok('/__wake?force=1 可绕过节流', r3.status === 200 && !j3.throttled);
+  }
+  {
+    mode = 'up-redirect';
+    const r = await call(authed('/gtw-ai/api/sms/send', { method: 'POST', body: 'x=1' }));
+    ok('上游 3xx → 原样透传 + 标 x-relay-redirect',
+      r.status === 302 && r.headers.get('x-relay-redirect') === '1',
+      'status=' + r.status + ' hdr=' + r.headers.get('x-relay-redirect'));
+    ok('3xx 也带 ttfb 头', r.headers.get('x-relay-ttfb-ms') !== null);
   }
 
   out('\n────────────────────────────────');

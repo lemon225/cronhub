@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-22e';
+const SMS_BUILD = 'audit-batch-24';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;

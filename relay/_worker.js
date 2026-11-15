@@ -1,6 +1,16 @@
 /**
  * CronHub SMS Relay · Cloudflare Pages（Advanced Mode / 根目录单文件 _worker.js）
- * RELAY_VER = relay-v4 · 2026-11-14
+ * RELAY_VER = relay-v5 · 2026-11-15
+ *
+ * v5（批次 B 收口）：
+ *   · 所有拒绝响应（403 / 503 / 405）改成带 x-relay-ver 的 JSON —— 以前 403 是裸文本，
+ *     线上排障第一句「版本对不对」没法问。响应体仍不含任何密钥。
+ *   · /__wake 加 30 秒节流：这个端点有副作用（会触发站点调度），pages.dev 域名公开可扫，
+ *     不加节流等于给陌生人一个免费的重启按钮。?force=1 可绕过（仍需密钥）。
+ *   · /__status 增 keysSource / debt：把「密钥还内联在源码里」这条安全债变成可查询状态，
+ *     而不是只写在文档里等人想起来。
+ *   · 转发响应增 x-relay-ttfb-ms（= 等到响应头的耗时），3xx 增 x-relay-redirect。
+ *     注意 FORWARD_TIMEOUT_MS 覆盖的是「等到响应头」，正文流由平台超时兜底。
  *
  * v4（批次 A 止血）：
  *   · /__guard 的 ok 判据只看上游腿 —— 短信发不发得出去由「CF → 网关」决定；
@@ -52,8 +62,17 @@
  *   · /__guard 只打 /api/health，绝不打 /api/wake —— 后者触发调度会形成回环
  */
 
-const RELAY_VER = 'relay-v4';
+const RELAY_VER = 'relay-v5';
 const DEFAULT_HOST = '5gvas01.cmicmaap.com';
+
+/*
+ * /__wake 节流：只在同一个 isolate 内有效（换 isolate 就清零）。
+ * 它挡不住有决心的攻击者，但足以让「随手扫到的 URL 被反复点」不再变成
+ * 每分钟一次的站点唤醒 —— 这正是它存在的理由，不要理解成鉴权。
+ */
+const WAKE_MIN_INTERVAL_MS = 30000;
+let wakeLastAt = 0;
+let wakeLastResult = null;
 
 const SITE_HEALTH_INLINE = 'https://cronhub.app.workbuddy.host/api/health?sharecode=ZDRK2MO6CP';
 const WAKE_BASE_INLINE = 'https://cronhub.app.workbuddy.host/api/wake?sharecode=ZDRK2MO6CP';
@@ -117,6 +136,25 @@ function keyring(env) {
   if (fromEnv) return parseKeys(fromEnv);
   if (env.RELAY_SECRET) return [['default', String(env.RELAY_SECRET)]];
   return parseKeys(RELAY_KEYS_INLINE);
+}
+
+/** 密钥是从变量来的还是源码来的 —— 决定「轮换要不要重新部署」 */
+function keysSource(env) {
+  if (String(env.RELAY_KEYS || '').trim()) return 'env:RELAY_KEYS';
+  if (env.RELAY_SECRET) return 'env:RELAY_SECRET';
+  return 'inline';
+}
+
+/**
+ * 安全债清单：把「凭据还硬编码在源码里」这件事做成可查询字段。
+ * 只回类别，不回值 —— /__status 是诊断端点，不是密钥出口。
+ */
+function securityDebt(env) {
+  const debt = [];
+  if (keysSource(env) === 'inline') debt.push('relay-key-inline');
+  if (!String(env.WAKE_URL || '').trim() && !String(env.WAKE_TOKEN || '').trim()) debt.push('wake-token-inline');
+  if (!String(env.SITE_HEALTH_URL || '').trim()) debt.push('site-health-sharecode-inline');
+  return debt;
 }
 
 function allowedHosts(env) {
@@ -237,9 +275,10 @@ export default {
       url.searchParams.get('key') ||
       '';
     const ring = keyring(env);
-    if (!ring.length) return json({ ok: false, error: 'relay keys not configured' }, 503);
+    if (!ring.length) return json({ ok: false, error: 'relay keys not configured', ver: RELAY_VER }, 503);
     const hit = presented ? ring.find(([, k]) => safeEqual(k, presented)) : null;
-    if (!hit) return new Response('forbidden', { status: 403 });
+    // 拒绝也要带版本：线上第一步永远是「先确认跑的是哪一版」
+    if (!hit) return json({ ok: false, error: 'forbidden', ver: RELAY_VER }, 403);
     const userId = hit[0];
 
     // ---------- 2) 上游白名单 ----------
@@ -264,8 +303,11 @@ export default {
         timeouts: T,
         wakeConfigured: !!wakeUrl(env),
         wakeFromEnv: !!(env.WAKE_URL || env.WAKE_TOKEN),
+        wakeThrottleSec: WAKE_MIN_INTERVAL_MS / 1000,
         siteHealthHost: healthHost,
         keys: ring.length,
+        keysSource: keysSource(env),
+        debt: securityDebt(env),
         endpoints: ['/__status', '/__probe', '/__echo', '/__wake', '/__guard', '<forward>'],
       });
     }
@@ -295,7 +337,26 @@ export default {
     }
 
     if (url.pathname === '/__wake') {
+      /*
+       * 有副作用的端点必须限速：它会让站点当场跑一次调度。
+       * 节流窗口内直接回上次结果，调用方仍拿到可用信息（不会误判成故障）。
+       */
+      const force = url.searchParams.get('force') === '1';
+      const now = Date.now();
+      if (!force && wakeLastAt && now - wakeLastAt < WAKE_MIN_INTERVAL_MS) {
+        const waitMs = WAKE_MIN_INTERVAL_MS - (now - wakeLastAt);
+        logLine({ kind: 'wake', user: userId, ok: true, throttled: true, waitMs, edge });
+        return json({
+          ok: true, throttled: true, waitMs, last: wakeLastResult,
+          ver: RELAY_VER, edge, hint: '30 秒内已唤醒过；确需立刻再跑一次用 ?force=1',
+        });
+      }
+      wakeLastAt = now;
       const site = await wakeSite(env, T.wake);
+      wakeLastResult = {
+        at: new Date(now).toISOString(), ok: site.ok, status: site.status,
+        ms: site.ms, ranNow: site.ranNow, count: site.count, wokeAt: site.wokeAt,
+      };
       logLine({ kind: 'wake', user: userId, ok: site.ok, ms: site.ms, edge });
       // body 字段保留给 v1 调用方；结构化字段给新调用方
       return json({ ok: site.ok, status: site.status, ms: site.ms, body: site.body || '', site, ver: RELAY_VER, edge },
@@ -362,6 +423,11 @@ export default {
     out.set('x-relay-ver', RELAY_VER);
     // 中继 → 网关这段的真实耗时：站点侧据此把「本站到 CF」和「CF 到网关」分开看
     out.set('x-relay-upstream-ms', String(r.ms));
+    // 同上，但语义说清楚：这是「等到响应头」的耗时。FORWARD_TIMEOUT_MS 也只看这一段，
+    // 正文流由平台超时兜底 —— 避免有人拿它当「整段传输耗时」用。
+    out.set('x-relay-ttfb-ms', String(r.ms));
+    // 上游回了跳转就明说：调用方（send.cjs）那边 3xx 一律判失败，不再当成功
+    if (r.status >= 300 && r.status < 400) out.set('x-relay-redirect', '1');
     logLine({ kind: 'forward', user: userId, host: wantHost, path: fwd.pathname,
       status: r.status, ms: r.ms, edge });
     return new Response(r.res.body, {

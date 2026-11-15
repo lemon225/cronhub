@@ -72,7 +72,7 @@ function stubFetch({ siteAborts = true, upstreamDown = false } = {}) {
   ok('站点腿单列 siteOk:false', b.siteOk === false, b.siteOk);
   ok('verdict 标注 channel-ok-site-slow', b.verdict === 'channel-ok-site-slow', b.verdict);
   ok('上游结果原样带回（403 属探针预期）', b.upstream && b.upstream.ok === true && b.upstream.status === 403, b.upstream);
-  ok('版本已升到 relay-v4', b.ver === 'relay-v4', b.ver);
+  ok('版本已升到 relay-v5', b.ver === 'relay-v5', b.ver);
 
   // B 上游不通 —— 这才是该报的故障
   stubFetch({ upstreamDown: true });

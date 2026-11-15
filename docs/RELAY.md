@@ -1,6 +1,6 @@
 # CronHub × Cloudflare 中继技术文档
 
-> 版本：`relay-v4` / `companion-v3` · **2026-11-14 已上线**（`/__status` 回 `ver: relay-v4`）
+> 版本：`relay-v5` / `companion-v3` · **2026-11-15 已上线**（`/__status` 回 `ver: relay-v5`）
 > 源码：`relay/_worker.js`（Pages 中继）、`relay/worker-companion.js`（定时陪护 Worker）、`relay/index.html`
 > 线上：`https://cronhub-sms-relay.pages.dev` · 站点 `https://cronhub.app.workbuddy.host/?sharecode=ZDRK2MO6CP`
 > 根因证据、超时预算、判据语义、实测基线、已知限制 → [`SMS-CHAIN.md`](SMS-CHAIN.md)（本文只讲「怎么操作」）
@@ -27,8 +27,30 @@
 
 ---
 
-## 1. 一句话结论
+## 0.5 第十六批：relay-v5 收口（2026-11-15）
 
+只动边界，不动协议 —— 业务转发路径一行没改，改的是「出事时能不能看清」。
+
+| 改动 | 之前 | 现在 | 为什么 |
+|---|---|---|---|
+| 拒绝响应 | 403 回裸文本 `forbidden`，503 才带 JSON | 403 / 503 都是 JSON，且带 `x-relay-ver` | 线上第一句永远是「跑的是哪一版」，裸文本答不了 |
+| `/__wake` | 无限制，什么人都能点 | isolate 内 30 秒节流，`?force=1` 可绕 | 它会触发站点调度，pages.dev 公开可扫，等于免费重启按钮 |
+| `/__status` | 只报规模（`keys: 1`） | 增 `keysSource` / `debt[]` | 把「密钥还内联在源码」从文档条目变成可查询状态，不会再被忘掉 |
+| 转发响应头 | `x-relay-upstream-ms`（语义含糊） | 增 `x-relay-ttfb-ms`；3xx 增 `x-relay-redirect: 1` | 前者说明「超时只看 TTFB」，后者让 3xx 在站点侧显式判失败 |
+
+发送侧配套（`lib/sms/send.cjs`）：
+
+- 走中继时补 `X-Relay-Host`。不补的话中继一律用它的默认上游，将来 `apiUrl` 换第二台网关，
+  请求会被**悄悄投到老网关**；补上之后白名单外直接 403，错得明明白白
+- `parseHttpError` 增 3xx 分支。以前 3xx 落到 `isSuccess:null`，被当成「业务码解析失败」，
+  提示语指向短信内容，方向全错
+
+> 节流只在同一 isolate 内有效（换 isolate 清零）。它是「降低误触成本」，不是鉴权 ——
+> 真限速要上 Cloudflare WAF / Rate Limiting，见 `SMS-CHAIN.md` §11 第 5 条。
+
+---
+
+## 1. 一句话结论
 CronHub 的短信**只能**经 Cloudflare Pages 中继发出；网站与 Cloudflare 通过两条方向相反的定时探活互相盯着，任一侧失联都会在另一侧留下可查的状态与告警。
 
 ```
@@ -60,7 +82,7 @@ CronHub 的短信**只能**经 Cloudflare Pages 中继发出；网站与 Cloudfl
 | 项目名 | `cronhub-sms-relay` | `sms-relay` |
 | 域名 | `cronhub-sms-relay.pages.dev` | `sms-relay.*.workers.dev` |
 | 源码 | `relay/_worker.js` | `relay/worker-companion.js` |
-| 版本标记 | `relay-v4`（响应头 `x-relay-ver`） | `companion-v3`（日志 `ver` 字段） |
+| 版本标记 | `relay-v5`（响应头 `x-relay-ver`） | `companion-v3`（日志 `ver` 字段） |
 | 职责 | 短信业务转发 + 探针 + 双向体检 | 每 30 分钟从外部唤醒网站 |
 | 云端可达性 | ✅ 可达 | ❌ 被定向阻断（见 §3） |
 | 触发方式 | 被网站请求 | Cloudflare Cron Trigger `*/30 * * * *` |
@@ -102,7 +124,7 @@ CronHub 的短信**只能**经 Cloudflare Pages 中继发出；网站与 Cloudfl
 
 ```json
 {
-  "ok": true, "channelOk": true, "siteOk": false, "ver": "relay-v4", "edge": "SJC", "user": "cronhub",
+  "ok": true, "channelOk": true, "siteOk": false, "ver": "relay-v5", "edge": "SJC", "user": "cronhub",
   "verdict": "channel-ok-site-slow",
   "upstream": { "ok": true, "host": "5gvas01.cmicmaap.com", "status": 403, "ms": 169 },
   "site": { "ok": false, "status": 0, "ms": 20001, "error": "The operation was aborted", "kind": "timeout" },
@@ -230,7 +252,7 @@ node <wrangler>/bin/wrangler.js pages deploy pages-adv \
 
 ```bash
 curl -s -H "X-Relay-Secret: $SECRET" https://cronhub-sms-relay.pages.dev/__status
-# 期望 ver=relay-v4，响应头 x-relay-ver: relay-v4
+# 期望 ver=relay-v5，响应头 x-relay-ver: relay-v5
 ```
 
 ### 6.3 Workers 定时陪护
@@ -317,7 +339,7 @@ schedules http 200 {"schedules":[{"cron":"*/30 * * * *", ...}]}
 
 | 症状 | 先查 | 判据与处置 |
 |---|---|---|
-| 短信全失败 | `/__status` | `ver` 不是 `relay-v4` → 部署没生效；`wakeConfigured:false` → 令牌配置丢 |
+| 短信全失败 | `/__status` | `ver` 不是 `relay-v5` → 部署没生效；`wakeConfigured:false` → 令牌配置丢 |
 | 短信全失败，status 正常 | `/__probe` | `ok:false` + `errorKind:timeout` → 网关侧抖动；`ok:true,status:403` → 中继没问题，查网站侧凭据/额度 |
 | 网站睡过头 | `/api/health` 的 `companion.wake` | `lastWokeAt` 不前进 → Worker Cron 掉了，按 §6.3 核对 `schedules` 与 `handlers` |
 | 唤醒 401 | 两面令牌比对 | `settings.wake.token` 与 Worker 的 `WAKE_TOKEN`/内置值不一致 → 走 §7 轮换 |

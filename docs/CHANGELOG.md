@@ -6,6 +6,45 @@
 
 ---
 
+## 2026-11-15 · 第二十四批（已上线）· relay-v5 收口 + 保活 v3 · `audit-batch-24`
+
+**需求**：审阅短信中继与两个定时任务（`instabox-keepalive` `*/5`、`sms-relay` 陪护 `*/30`），
+按站点工程师视角找问题、提优化、改完自检。
+
+**中继 `relay-v5`**（业务转发路径一行未改，只改边界与可观测）
+- 403 / 503 一律回 JSON 且带 `x-relay-ver`（以前 403 是裸文本，排障答不了「哪一版」）
+- `/__wake` 加 30 秒 isolate 内节流，`?force=1` 可绕 —— 它有副作用（触发站点调度），
+  而 `pages.dev` 公开可扫，等于一个免费重启按钮
+- `/__status` 增 `keysSource` / `debt[]`：把「密钥仍内联在源码」这条安全债变成可查询状态
+- 转发响应增 `x-relay-ttfb-ms`（说清超时只看 TTFB）、3xx 增 `x-relay-redirect: 1`
+
+**发送侧 `lib/sms/send.cjs`**
+- 走中继时补 `X-Relay-Host`：不补的话中继一律用默认上游，将来 `apiUrl` 换第二台网关会被静默错投
+- `parseHttpError` 增 3xx 分支：以前落到 `isSuccess:null`，提示语错指短信内容
+
+**保活 Worker → v3**（`instabox-keepalive`，源码仍叫 `worker.v2.js`）
+- 换轮阈值 `maxRun-20` → `maxRun-5`：v2 在 age=100 就换轮，把免费档「还剩 5 分钟自动 +120」
+  的延长链掐断，每天白停 14 次机；改后单轮可涨到 475 分钟，停机降到每天约 3 次
+- 唤醒后读状态确认：v2「租约回 200 即认为已醒」，一条被接受的租约就能让机器永久躺平
+- 租约 TTL 900 → 1800（容忍 6 次 cron 漏触发）；`scheduled` 加 try/catch；
+  `/health` 改 JSON 带心跳新鲜度；看板加「保活心跳」行，>20 分钟标黄
+- `/run` `/wake` 改 fail-closed：没配 `WAKE_TOKEN` 一律 403
+
+**验证**
+- `npm test` 12 个文件全通；中继本地用例 27 → 36 项（新增节流 / 3xx / debt 三组）
+- 线上 `/__status` `ver=relay-v5`、`debt` 三条自报；`/__guard` `ok:true` 两侧通（SJC，1878ms）
+- 端到端转发实测：空包 POST 到网关回 `code:10002`（缺 Authorization），
+  响应头 `x-relay-ver` / `x-relay-upstream-ms` / `x-relay-ttfb-ms` 齐备，未触发真实短信
+- 保活 `/health` 经只读镜像：`state=running age=61/120 cycleAt=115 beatFresh=true`
+
+**未采纳**（记录理由，避免下次重复讨论）
+- CronHub 那个 20 分钟 `instabox` 探测保持不动：它证明的是「公网真能打开投屏页」，
+  与 Worker 的「续租成功」是两种失败模式，`retry:1 / 10s` 已覆盖 10.5 秒的换轮停机
+- `sms-relay` 陪护 Worker 未改：出站全走 `timedFetch`（自带超时与错误分类），
+  scheduled 内两步各自独立，实际无可抛点；改它收益低于风险
+
+---
+
 ## 2026-11-15 · 第二十三批（源码就绪，未上线）· 变量加工与通用脚本云函数 · `cloudfn-v1`
 
 **需求**：在环境变量之上做变量加工，定义「今天算明天并调整格式」这类派生量（如 `tomorrowtime`），并形成通用编写方案，方便 AI 直接产出脚本。
