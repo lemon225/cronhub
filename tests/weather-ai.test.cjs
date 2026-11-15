@@ -187,10 +187,12 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     req.on('data', (d) => { raw += d.toString(); });
     req.on('end', () => {
       seen.push(raw);
-      // 第一次故意编数字，触发事实校验的纠正重试；第二次给合规版本。
+      // 第一次故意编数字触发纠正；第二次给「合规但 °C 前带空格」的版本，
+      // 用来验证服务端会按任务要求做确定性归一。
+      const goodSpaced = '❄️ 今晚多云，最低-1.4 °C\n⛅ 明天07-19时小雪-1.9~5.7 °C\n⚠️ 道路结冰黄色预警；明早慢行';
       const body = seen.length === 1
         ? '❄️ 今晚小雪，最低-9.9°C\n⛅ 明天晴间多云，-3.6~5.7°C'
-        : good;
+        : goodSpaced;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ title: 't', body }) } }] }));
     });
@@ -210,7 +212,7 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     schedules: [{ mode: 'cron', cron: '0 19 * * *' }], schedule: { mode: 'cron', cron: '0 19 * * *' },
     config: {
       url: u('current'), method: 'GET', expectStatus: 200, timeoutSec: 8,
-      notifyPrompt: '只输出 3 行；正文 ≤58 字；数字必须出自原始数据。',
+      notifyPrompt: '只输出 3 行；正文 ≤58 字；数字必须出自原始数据；°C 紧贴数字。',
       notify: { enabled: true, channels: [] },
       steps: NAMES.map((n) => ({ name: n, url: u(n), method: 'GET' })),
     },
@@ -271,7 +273,7 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
         ok('纠正消息点名违规数字',
           JSON.stringify(req2.messages).includes('没通过检查') && JSON.stringify(req2.messages).includes('-9.9'));
       }
-      ok('最终正文采用纠正后的合规版本',
+      ok('最终正文为纠正后的合规版本，且 °C 前的空格被确定性归一',
         notes[0] && notes[0].body === good, notes[0] && notes[0].body);
       ok('aiNote 显示 5 项校验', notes[0] && /已校验 5 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
     }

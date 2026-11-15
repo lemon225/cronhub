@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-22b';
+const SMS_BUILD = 'audit-batch-22c';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2759,6 +2759,11 @@ async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskNa
   const maxAttempts = Math.min(AI_ATTEMPTS_MAX, Math.max(1, Number(cfg.maxAttempts) || AI_MAX_ATTEMPTS));
   const url = cfg.baseUrl.replace(/\/+$/, '') + '/chat/completions';
   const plan = aiPrompts({ instruction, taskInstruction, taskName, title, body, rawData });
+  // 「°C 紧贴数字」是任务级硬要求，system 的通用体例却写着「数字与单位之间
+  // 留一个空格」。模型会在两条约束间摇摆，实测同一输入输出过 -1.4 °C 与
+  // -1.4°C 两版 —— 按任务要求做一次确定性归一，不指望模型每次自觉。
+  const taskNeed = String(taskInstruction || '');
+  const tightUnits = /紧贴/.test(taskNeed) && /°C/.test(taskNeed);
   const messages = [
     { role: 'system', content: plan.system },
     { role: 'user', content: plan.user },
@@ -2781,13 +2786,12 @@ async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskNa
     if (!m) throw new Error('AI 返回内容无法解析');
     const parsed = JSON.parse(m[0]);
     if (!parsed || !parsed.title) throw new Error('AI 返回缺少 title');
-    return {
-      title: String(parsed.title).slice(0, 40),
-      // 模型有时把换行写成字面 \n 而非 JSON 转义，统一还原成真换行，
-      // 否则分行卡片式会退化成一整段。不再静默截到 800 字：
-      // 正常输出远短于此，异常跑飞时才裁，且裁了会明确标注。
-      body: clipBody(String(parsed.body || '').replace(/\\n/g, '\n')),
-    };
+    // 模型有时把换行写成字面 \n 而非 JSON 转义，统一还原成真换行，
+    // 否则分行卡片式会退化成一整段。不再静默截到 800 字：
+    // 正常输出远短于此，异常跑飞时才裁，且裁了会明确标注。
+    let bodyText = String(parsed.body || '').replace(/\\n/g, '\n');
+    if (tightUnits) bodyText = bodyText.replace(/(\d)\s+(°C)/g, '$1$2');
+    return { title: String(parsed.title).slice(0, 40), body: clipBody(bodyText) };
   };
 
   let lastErr = null;
