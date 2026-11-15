@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-32';
+const SMS_BUILD = 'audit-batch-33';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -4825,9 +4825,17 @@ function summarizeQWeatherStep(j) {
   }
 
   // ④ 预警：空也要写明「无」，否则模型容易自己编一条 ⚠
+  // 失效的不列：材料里留着过期的预警，模型照抄也能过 fact-source（它只查
+  // 「材料里有没有」），等于把过期预警洗成合规输出。
   if (Array.isArray(j.alerts)) {
-    if (!j.alerts.length) lines.push('预警 无');
-    for (const a of j.alerts.slice(0, 3)) {
+    const live = j.alerts.filter((a) => {
+      const t = Date.parse((a && a.expireTime) || '');
+      return !Number.isFinite(t) || t > Date.now();
+    });
+    if (!live.length) {
+      lines.push(j.alerts.length ? `预警 无（${j.alerts.length} 条已失效，不列）` : '预警 无');
+    }
+    for (const a of live.slice(0, 3)) {
       const t = (a.eventType && a.eventType.name) || a.headline || '';
       const lv = (a.color && a.color.code) || '';
       lines.push(`预警 ${t}/${lv} 发布=${a.senderName || ''} 失效至=${String(a.expireTime || '').slice(0, 16)} 摘要=${String(a.headline || '').slice(0, 30)}`);
@@ -4930,7 +4938,18 @@ function qWeatherFacts(steps) {
   const bandText = [...new Set([rowTonight.text, rowTomorrow.text].filter(Boolean))].join('、');
 
   const LV = { yellow: '黄色', orange: '橙色', red: '红色', blue: '蓝色' };
-  const a0 = alerts[0];
+  /*
+   * 只播此刻仍生效的预警。和风 alerts 会把刚失效的那条一起返回（夜里发的结冰
+   * 预警，第二天早上还在数组里），直接取 alerts[0] 就是把过期预警当现状播出去。
+   * 多条同时生效时按级别取最严重的那条：三行 58 字只放得下一条，而数组顺序
+   * 是发布时间，最新那条可能正好是最轻的蓝色。
+   */
+  const alive = alerts.filter((a) => {
+    const t = Date.parse((a && a.expireTime) || '');
+    return !Number.isFinite(t) || t > Date.now();
+  });
+  const sev = (a) => ({ blue: 1, yellow: 2, orange: 3, red: 4 })[(a && a.color && a.color.code) || ''] || 0;
+  const a0 = alive.slice().sort((x, y) => sev(y) - sev(x))[0];
   const lvCode = (a0 && a0.color && a0.color.code) || '';
   const warnName = a0
     ? `${(a0.eventType && a0.eventType.name) || ''}${LV[lvCode] || ''}预警`

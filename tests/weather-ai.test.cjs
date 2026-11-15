@@ -90,7 +90,8 @@ function qwFixture(opts = {}) {
     },
     hourly: { hours },
     alert: { alerts: [{ eventType: { name: '道路结冰' }, color: { code: 'yellow' },
-      senderName: '广河县气象台', headline: '广河县气象台发布道路结冰黄色预警信号', expireTime: '2026-11-15T16:20Z' }] },
+      senderName: '广河县气象台', headline: '广河县气象台发布道路结冰黄色预警信号', // 失效时间必须远离今天：写死成"当天晚些时候"会让这条断言在零点后自己失败
+      expireTime: '2026-12-31T16:20Z' }] },
     air: { indexes: [{ aqi: 43, category: '优' }] },
   };
 }
@@ -126,6 +127,27 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   ok('预警名直接给中文全名，不用模型自己翻译 yellow',
     facts.some((l) => l.includes('预警名=道路结冰黄色预警'))
     && facts.some((l) => l.includes('AQI=43')));
+  // 和风会把刚失效的预警一起返回：夜里发的结冰预警，第二天早上还在数组里。
+  const expired = qwFixture();
+  expired.alert.alerts[0].expireTime = '2026-11-14T16:20Z';
+  ok('已失效的预警不再当现状播出去',
+    W.qWeatherFacts(stepsOf(expired, NAMES)).some((l) => l.startsWith('预警名=无')),
+    W.qWeatherFacts(stepsOf(expired, NAMES)));
+  const noExpire = qwFixture();
+  delete noExpire.alert.alerts[0].expireTime;
+  ok('没有失效时间的预警不误杀',
+    W.qWeatherFacts(stepsOf(noExpire, NAMES)).some((l) => l.includes('预警名=道路结冰黄色预警')));
+  const expiredText = W.summarizeStepData(stepsOf(expired, NAMES));
+  ok('失效预警也不留在材料里（否则模型照抄照样合规）',
+    !/预警 道路结冰/.test(expiredText) && /预警 无（1 条已失效，不列）/.test(expiredText), expiredText.slice(-160));
+  const multi = qwFixture();
+  multi.alert.alerts = [
+    { ...multi.alert.alerts[0], color: { code: 'blue' }, eventType: { name: '寒潮' } },
+    { ...multi.alert.alerts[0], color: { code: 'orange' }, eventType: { name: '暴雪' } },
+  ];
+  ok('多条同时生效时取最严重的一条，不取数组第一个',
+    W.qWeatherFacts(stepsOf(multi, NAMES)).some((l) => l.includes('预警名=暴雪橙色预警')),
+    W.qWeatherFacts(stepsOf(multi, NAMES)));
   ok('降水按今晚 / 明天分开，今晚不再被套上明天的时段',
     facts.some((l) => l.startsWith('今晚 ') && l.includes('降水=无'))
     && facts.some((l) => l.startsWith('明天 ') && l.includes('降水=07-19时')));
