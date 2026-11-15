@@ -44,7 +44,7 @@ function pure(blockStart, blockEnd, prefix, names) {
 const W = pure('function qwSpan(', '/**\n * 生成推送内容',
   'const RESULT_BODY_MAX=200000;', ['qwSpan', 'summarizeQWeatherStep', 'qWeatherFacts', 'summarizeStepData']);
 const A = pure('function aiRules(', '/**\n * 拼装提示词', '',
-  ['aiRules', 'aiReview', 'aiIconPool', 'dedupeIcons']);
+  ['aiRules', 'aiReview', 'aiIconPool', 'dedupeIcons', 'aiFabricationViolations']);
 
 function hour(day, h, text, precip) {
   return {
@@ -208,6 +208,14 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   ok('材料无结论区却写天气内容被拦',
     A.aiReview('❄️ 今晚18-22时雨夹雪\n⛅ 明天05-19时雪\n⚠️ 道路结冰橙色预警；明早慢行',
       rSrc, '[[实况] 成功 HTTP 200').some((v) => v.hard && v.msg.includes('没有【事实结论】区')));
+  ok('纠正用尽仍编造时判为不可采用',
+    A.aiFabricationViolations(fakeWeather).length === 1
+      && A.aiFabricationViolations([{ hard: true, msg: '输出 2 行，应为 3 行' }]).length === 0
+      && A.aiFabricationViolations([]).length === 0, fakeWeather);
+  ok('合规结果不会被误判为编造',
+    A.aiFabricationViolations(A.aiReview(
+      '❄️ 今晚多云，最低-1.5°C\n⛅ 明天07-19时小雪，-1.5°C~6.3°C\n'
+      + '⚠️ 道路结冰黄色预警；明早慢行', rSrc, srcFacts)).length === 0);
 
   console.log('\n[4b] 图标全篇不重复：机检留痕 + 服务端确定性归一');
   const iconPrompt = '只输出 3 行；正文 ≤58 字；图标全篇不重复。今晚行：❄️ 明天行：⛅ 建议行：🧣 预警 ⚠️';

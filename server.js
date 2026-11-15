@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-26';
+const SMS_BUILD = 'audit-batch-26b';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2663,6 +2663,12 @@ function aiRules(text) {
     rules.push({ kind: 'fact-source', hard: true, label: '天气词 / 时段 / 预警出自结论区' });
   }
   return rules;
+}
+
+/** 事实来源类硬违规：AI 写出了材料里没有的天气内容，纠正用完仍出现就不能采用。 */
+function aiFabricationViolations(violations) {
+  return (Array.isArray(violations) ? violations : []).filter(
+    (v) => v && v.hard && /事实结论区没有|材料没有【事实结论】区/.test(String(v.msg || '')));
 }
 
 /** 去空白字数：用户数的是可见字，空格与换行不计。 */
@@ -5353,7 +5359,16 @@ async function runTask(task, trigger) {
         instruction: aiHead, taskInstruction: aiTaskNeed,
         taskName: task.name, rawData,
       });
-      if (polished) {
+      const fakeBad = aiFabricationViolations(polished && polished.violations);
+      if (fakeBad.length) {
+        // 两次纠正仍写出材料外内容：不采用 AI 正文，保留接口原文，并留一条可查记录。
+        aiNote = '⚠ 本次为接口原始数据（AI 写出材料外内容，已拦截）';
+        pushSysLog({
+          level: 'warn', source: 'ai',
+          msg: `AI 输出含编造内容，已放弃：${task.name}`,
+          detail: { taskId: task.id, violations: fakeBad.map((v) => v.msg) },
+        });
+      } else if (polished) {
         /*
          * 标题固定用任务名。AI 曾把「24 h天气三甲集」改写成
          * 「甘肃广河三甲集 24h 天气播报」，又长又不在任务列表里，
