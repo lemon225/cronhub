@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-22';
+const SMS_BUILD = 'audit-batch-22b';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -4684,13 +4684,16 @@ function qWeatherFacts(steps) {
   const d0 = days[0] || {}, d1 = days[1] || {};
   const tonight = d0.nighttime || {}, tomorrow = d1.daytime || {}, tomorrowNight = d1.nighttime || {};
 
-  // 降水区间：先扫逐小时的最早/最晚降水小时；hourly 没覆盖到就退逐日的白天/夜间时段。
-  const wet = hours.filter((h) => /[雨雪]/.test(cond(h))
-    || Number((h.precipitation && h.precipitation.amount && h.precipitation.amount.value) || 0) > 0);
+  // 降水区间：逐小时只认现象文本里明确写了雨/雪的小时。
+  // 不能用 amount>0 兜：和风 v1 会把逐日白天的雪量挂到某一小时，那条记录的
+  // condition 却是「中度霾」（11-15 实测算出「11-11时」）。没有明确雨雪现象时
+  // 一律退逐日的白天/夜间时段，那边有 forecastStartTime/EndTime，更可信。
+  const wet = hours.filter((h) => /[雨雪]/.test(cond(h)));
   let band = '', bandSrc = '', bandText = '';
   if (wet.length) {
     const hh = (h) => String(h.forecastTime || '').slice(11, 13);
-    band = `${hh(wet[0])}-${hh(wet[wet.length - 1])}时`;
+    const first = hh(wet[0]), last = hh(wet[wet.length - 1]);
+    band = first === last ? `${first}时` : `${first}-${last}时`;
     bandSrc = '逐小时';
     bandText = cond(wet.find((h) => /雪/.test(cond(h))) || wet.find((h) => /雨/.test(cond(h))) || wet[0]);
   } else {
@@ -4711,14 +4714,37 @@ function qWeatherFacts(steps) {
     }
   }
 
-  const lines = ['【事实结论｜优先直接引用，禁止自行扫描或推算】'];
-  lines.push(`今晚 日期=${String(d0.forecastStartTime || '').slice(0, 10)} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 时段=${qwSpan(tonight.forecastStartTime, tonight.forecastEndTime)}`);
-  lines.push(`明天 日期=${String(d1.forecastStartTime || '').slice(0, 10)} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 时段=${qwSpan(tomorrow.forecastStartTime, tomorrow.forecastEndTime)}`);
-  lines.push(`降水区间=${band || '无'} 来源=${bandSrc || '无降水'} 类型=${bandText || '无'}`);
+  // 降水区间归属到「今晚」还是「明天」：只给一个总区间时，模型会把它同时
+  // 套进两行（实测今晚也写了 19-07时），多出的 6 字又把 58 字上限挤爆，
+  // 于是「黄色」时有时无 —— 剩下这点摇摆全来自这里。
+  const d0date = String(d0.forecastStartTime || '').slice(0, 10);
+  const d1date = String(d1.forecastStartTime || '').slice(0, 10);
+  let tonightBand = '无', tomorrowBand = '无';
+  if (band) {
+    if (bandSrc.startsWith('明天')) tomorrowBand = band;
+    else if (bandSrc.startsWith('今晚')) tonightBand = band;
+    else {
+      const t0 = String((wet[0] && wet[0].forecastTime) || '');
+      const fd = t0.slice(0, 10), hh = Number(t0.slice(11, 13));
+      if ((fd === d0date && hh >= 19) || (fd === d1date && hh <= 7)) tonightBand = band;
+      else tomorrowBand = band;
+    }
+  }
+
+  const LV = { yellow: '黄色', orange: '橙色', red: '红色', blue: '蓝色' };
   const a0 = alerts[0];
+  const lvCode = (a0 && a0.color && a0.color.code) || '';
+  const warnName = a0
+    ? `${(a0.eventType && a0.eventType.name) || ''}${LV[lvCode] || ''}预警`
+    : '无';
+
+  const lines = ['【事实结论｜优先直接引用，禁止自行扫描或推算】'];
+  lines.push(`今晚 日期=${d0date} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 时段=${qwSpan(tonight.forecastStartTime, tonight.forecastEndTime)} 降水时段=${tonightBand}`);
+  lines.push(`明天 日期=${d1date} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 时段=${qwSpan(tomorrow.forecastStartTime, tomorrow.forecastEndTime)} 降水时段=${tomorrowBand}`);
+  lines.push(`降水区间=${band || '无'} 来源=${bandSrc || '无降水'} 类型=${bandText || '无'}`);
   lines.push(a0
-    ? `预警=${(a0.eventType && a0.eventType.name) || ''}/${(a0.color && a0.color.code) || ''} 摘要=${String(a0.headline || '').slice(0, 30)}`
-    : '预警=无');
+    ? `预警名=${warnName} 级别=${lvCode} 摘要=${String(a0.headline || '').slice(0, 30)}`
+    : '预警名=无');
   if (indexes.length) lines.push(`空气质量 AQI=${indexes[0].aqi} 等级=${indexes[0].category || ''}`);
   return lines;
 }

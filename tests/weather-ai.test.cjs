@@ -113,7 +113,7 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     lines.some((l) => l.includes('daily[1]') && l.includes('禁用于明天温度区间')));
 
   console.log('\n[2] 事实结论：今晚 / 明天 / 降水区间 / 预警由服务端算好');
-  const facts = lines.filter((l) => /^(今晚 |明天 |降水区间=|预警=|空气质量 )/.test(l));
+  const facts = lines.filter((l) => /^(今晚 |明天 |降水区间=|预警名=|空气质量 )/.test(l));
   ok('结论行齐全（5 行）', facts.length === 5, facts);
   ok('今晚取夜间现象与夜间最低',
     facts.some((l) => l.startsWith('今晚 ') && l.includes('现象=多云') && l.includes('最低=-1.4°C')));
@@ -122,8 +122,12 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
       && l.includes('最低=-1.9°C') && l.includes('最高=5.7°C') && !l.includes('-3.6')));
   ok('hourly 无降水时，降水区间退回逐日白天时段并注明来源',
     facts.some((l) => l.startsWith('降水区间=07-19时') && l.includes('明天白天/逐日') && l.includes('类型=小雪')));
-  ok('预警与空气质量进结论', facts.some((l) => l.includes('道路结冰/yellow'))
+  ok('预警名直接给中文全名，不用模型自己翻译 yellow',
+    facts.some((l) => l.includes('预警名=道路结冰黄色预警'))
     && facts.some((l) => l.includes('AQI=43')));
+  ok('降水时段按今晚 / 明天分开，今晚不再被套上明天的时段',
+    facts.some((l) => l.startsWith('今晚 ') && l.includes('降水时段=无'))
+    && facts.some((l) => l.startsWith('明天 ') && l.includes('降水时段=07-19时')));
 
   console.log('\n[3] 降水区间：逐小时优先、跨午夜连写、无降水写「无」');
   const wetHours = Array.from({ length: 24 }, (_, i) => {
@@ -135,6 +139,24 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   const wetFacts = W.qWeatherFacts(stepsOf(qwFixture({ hours: wetHours }), NAMES));
   ok('逐小时扫出 22-03时，不拆段不写两个「时」',
     wetFacts.some((l) => l.includes('降水区间=22-03时') && l.includes('来源=逐小时')), wetFacts);
+  ok('跨午夜降水归今晚，不误挂到明天',
+    wetFacts.some((l) => l.startsWith('今晚 ') && l.includes('降水时段=22-03时'))
+    && wetFacts.some((l) => l.startsWith('明天 ') && l.includes('降水时段=无')), wetFacts);
+  // 和风 v1 把逐日白天的雪量挂到一条「中度霾」小时上：只看 amount>0 会算出 11-11时。
+  const misleading = qwFixture();
+  misleading.hourly.hours[23] = {
+    ...misleading.hourly.hours[23], condition: { text: '中度霾' },
+    precipitation: { amount: { value: 0.4 }, type: 'snow', probability: 0.03 },
+  };
+  const mf = W.qWeatherFacts(stepsOf(misleading, NAMES));
+  ok('现象为霾、仅 amount>0 的小时不算降水，退回逐日 07-19时',
+    mf.some((l) => l.includes('降水区间=07-19时') && l.includes('明天白天/逐日'))
+    && !mf.some((l) => l.includes('11-11时')), mf);
+  const oneWet = qwFixture();
+  oneWet.hourly.hours[5] = hour(15, 16, '小雪', 0.3);
+  ok('只有一个降水小时写「16时」，不写「16-16时」',
+    W.qWeatherFacts(stepsOf(oneWet, NAMES)).some((l) => l.includes('降水区间=16时')),
+    W.qWeatherFacts(stepsOf(oneWet, NAMES)));
   const dry = qwFixture();
   dry.daily.days[1].daytime.precipitation = { amount: { value: 0 }, type: 'none', probability: 0 };
   const dryFacts = W.qWeatherFacts(stepsOf(dry, NAMES));
