@@ -122,7 +122,7 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     facts.some((l) => l.startsWith('明天 ') && l.includes('现象=小雪')
       && l.includes('最低=-1.9°C') && l.includes('最高=5.7°C') && !l.includes('-3.6')));
   ok('hourly 无降水时，降水区间退回逐日白天时段并注明来源',
-    facts.some((l) => l.startsWith('降水区间=07-19时') && l.includes('明天白天/逐日') && l.includes('类型=小雪')));
+    facts.some((l) => l.startsWith('降水区间=07-19时') && l.includes('来源=逐日') && l.includes('类型=小雪')));
   ok('预警名直接给中文全名，不用模型自己翻译 yellow',
     facts.some((l) => l.includes('预警名=道路结冰黄色预警'))
     && facts.some((l) => l.includes('AQI=43')));
@@ -154,9 +154,10 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   const sameDayFacts = W.qWeatherFacts(stepsOf(sameDayFixture, NAMES));
   ok('同一天内的降水写成 08-10时，不重复日期词',
     sameDayFacts.some((l) => l.startsWith('明天 ') && l.includes('降水=08-10时')), sameDayFacts);
-  ok('跨午夜降水归今晚，不误挂到明天',
+  ok('跨午夜降水只归今晚，明天拿自己那段 07-19时',
     wetFacts.some((l) => l.startsWith('今晚 ') && l.includes('降水=22-03时'))
-    && wetFacts.some((l) => l.startsWith('明天 ') && l.includes('降水=无')), wetFacts);
+    && wetFacts.some((l) => l.startsWith('明天 ') && l.includes('降水=07-19时')
+      && !l.includes('22-03时')), wetFacts);
   // 和风 v1 把逐日白天的雪量挂到一条「中度霾」小时上：只看 amount>0 会算出 11-11时。
   const misleading = qwFixture();
   misleading.hourly.hours[23] = {
@@ -165,12 +166,13 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   };
   const mf = W.qWeatherFacts(stepsOf(misleading, NAMES));
   ok('现象为霾、仅 amount>0 的小时不算降水，退回逐日 07-19时',
-    mf.some((l) => l.includes('降水区间=07-19时') && l.includes('明天白天/逐日'))
+    mf.some((l) => l.includes('降水区间=07-19时') && l.includes('来源=逐日'))
     && !mf.some((l) => l.includes('11-11时')), mf);
   const oneWet = qwFixture();
-  oneWet.hourly.hours[5] = hour(15, 16, '小雪', 0.3);
-  ok('只有一个降水小时写「16时」，不写「16-16时」',
-    W.qWeatherFacts(stepsOf(oneWet, NAMES)).some((l) => l.includes('降水区间=16时')),
+  oneWet.hourly.hours[10] = hour(15, 21, '小雪', 0.3);
+  ok('只有一个降水小时写「21时」，不写「21-21时」',
+    W.qWeatherFacts(stepsOf(oneWet, NAMES)).some((l) => l.startsWith('今晚 ') && l.includes('降水=21时'))
+    && !W.qWeatherFacts(stepsOf(oneWet, NAMES)).some((l) => l.includes('21-21时')),
     W.qWeatherFacts(stepsOf(oneWet, NAMES)));
   const dry = qwFixture();
   dry.daily.days[1].daytime.precipitation = { amount: { value: 0 }, type: 'none', probability: 0 };

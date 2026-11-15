@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-26f';
+const SMS_BUILD = 'audit-batch-27';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2790,13 +2790,18 @@ function aiReview(body, rules, factText) {
         add('结论区没有降水，正文却写了降水时刻', r.hard);
         continue;
       }
-      const a = Number(m[1]);
-      const b = m[2] == null ? a : Number(m[2]);
+      // 两行各有一段时，结论区会写成「19-07时、07-19时」：允许集合取所有段
+      // 的并集，否则第二行的合法时段会被当成编造。
+      const seg = ft.match(/降水区间=[^\n]*/)[0];
       const allow = new Set();
-      if (a <= b) for (let h = a; h <= b; h++) allow.add(h);
-      else {
-        for (let h = a; h <= 23; h++) allow.add(h);
-        for (let h = 0; h <= b; h++) allow.add(h);
+      for (const one of seg.matchAll(/(\d{1,2})(?:-(\d{1,2}))?时/g)) {
+        const a = Number(one[1]);
+        const b = one[2] == null ? a : Number(one[2]);
+        if (a <= b) for (let h = a; h <= b; h++) allow.add(h);
+        else {
+          for (let h = a; h <= 23; h++) allow.add(h);
+          for (let h = 0; h <= b; h++) allow.add(h);
+        }
       }
       const missing = used.filter((h) => !allow.has(h));
       if (missing.length) add(`降水时刻「${missing.join('、')}时」不在结论区区间内`, r.hard);
@@ -4857,58 +4862,55 @@ function qWeatherFacts(steps) {
   const n1 = (v, u = '') => (v == null || v === '' ? '' : `${Math.round(Number(v) * 10) / 10}${u}`);
   const cond = (o) => (o && o.condition && o.condition.text) || '';
   const d0 = days[0] || {}, d1 = days[1] || {};
-  const tonight = d0.nighttime || {}, tomorrow = d1.daytime || {}, tomorrowNight = d1.nighttime || {};
+  const tonight = d0.nighttime || {}, tomorrow = d1.daytime || {};
 
   // 逐日 / 逐小时的时间都带日期，取日期只用于定位「今晚」「明天」两行。
   const ymd = (o) => String((o && o.forecastStartTime) || '').slice(0, 10);
   const d0date = ymd(d0), d1date = ymd(d1);
 
-  // 降水区间：逐小时只认现象文本里明确写了雨/雪的小时。
-  // 不能用 amount>0 兜：和风 v1 会把逐日白天的雪量挂到某一小时，那条记录的
-  // condition 却是「中度霾」（11-15 实测算出「11-11时」）。没有明确雨雪现象时
-  // 一律退逐日的白天/夜间时段，那边有 forecastStartTime/EndTime，更可信。
+  /*
+   * 降水时段按行各算一次，不再只算一个总区间。
+   * 以前两行共用一个 band，只挂给先命中的那一行，另一行永远写「无」——实测
+   * 「明天中雪」整行没有任何时间，用户一眼就看出漏了。
+   *
+   * 每行优先级：本行窗口内的逐小时雨雪 > 本行逐日时段的昼夜区间 > 无。
+   * 逐小时只认现象文本里明确写了雨/雪的小时：和风 v1 会把逐日白天的雪量挂到
+   * 一条「中度霾」的小时上，只看 amount>0 会算出「11-11时」（11-15 实测）。
+   */
   const wet = hours.filter((h) => /[雨雪]/.test(cond(h)));
-  let band = '', bandSrc = '', bandText = '', startAt = '';
-  if (wet.length) {
-    const first = wet[0], last = wet[wet.length - 1];
-    const sIso = String(first.forecastTime || '');
-    const eIso = String(last.forecastTime || '');
-    const hh = (s) => s.slice(11, 13);
-    band = hh(sIso) === hh(eIso) ? `${hh(sIso)}时` : `${hh(sIso)}-${hh(eIso)}时`;
-    bandSrc = '逐小时';
-    bandText = cond(wet.find((h) => /雪/.test(cond(h))) || wet.find((h) => /雨/.test(cond(h))) || first);
-    startAt = sIso;
-  } else {
-    const cands = [
-      { part: tonight, label: '今晚夜间' },
-      { part: tomorrow, label: '明天白天' },
-      { part: tomorrowNight, label: '明天夜间' },
-    ];
-    for (const c of cands) {
-      const p = (c.part && c.part.precipitation) || {};
-      const has = (p.type && p.type !== 'none') || Number((p.amount && p.amount.value) || 0) > 0
-        || Number(p.probability || 0) >= 0.6;
-      if (!has) continue;
-      band = qwSpan(c.part.forecastStartTime, c.part.forecastEndTime);
-      bandSrc = `${c.label}/逐日`;
-      bandText = cond(c.part) || (p.type && p.type !== 'none' ? p.type : '');
-      break;
+  const hhOf = (s) => String(s || '').slice(11, 13);
+  const spanOf = (part) => qwSpan(part && part.forecastStartTime, part && part.forecastEndTime);
+  const rowOf = (part) => {
+    if (!part) return { band: '', src: '', text: '' };
+    const s = String(part.forecastStartTime || '');
+    const e = String(part.forecastEndTime || '');
+    const w = (s && e) ? wet.filter((h) => {
+      const t = String(h.forecastTime || '');
+      return t && t >= s && t < e;
+    }) : [];
+    if (w.length) {
+      const a = hhOf(w[0].forecastTime), b = hhOf(w[w.length - 1].forecastTime);
+      return {
+        band: a === b ? `${a}时` : `${a}-${b}时`,
+        src: '逐小时',
+        text: cond(w.find((h) => /雪/.test(cond(h))) || w.find((h) => /雨/.test(cond(h))) || w[0]),
+      };
     }
-  }
-  // 降水时段归属到「今晚」还是「明天」：只给一个总区间时，模型会把它同时
-  // 套进两行（实测今晚也写了 19-07时），多出的 6 字又把 58 字上限挤爆，
-  // 于是「黄色」时有时无 —— 剩下这点摇摆全来自这里。
-  let bandSide = '';
-  if (band) {
-    if (bandSrc.startsWith('明天')) bandSide = 'tomorrow';
-    else if (bandSrc.startsWith('今晚')) bandSide = 'tonight';
-    else {
-      const fd = startAt.slice(0, 10), hh = Number(startAt.slice(11, 13));
-      bandSide = ((fd === d0date && hh >= 19) || (fd === d1date && hh <= 7)) ? 'tonight' : 'tomorrow';
-    }
-  }
-  // 每行只给本行这一个时段，另一行写「无」——两行都不借对方的时段。
-  const bandOf = (side) => (band && bandSide === side ? band : '无');
+    const p = part.precipitation || {};
+    const has = (p.type && p.type !== 'none') || Number((p.amount && p.amount.value) || 0) > 0
+      || Number(p.probability || 0) >= 0.6;
+    // 逐日只有昼夜粒度，07-19 / 19-07 就是这一行的起止，直接给区间，不补时刻。
+    if (!has) return { band: '', src: '', text: '' };
+    return {
+      band: spanOf(part),
+      src: '逐日',
+      text: cond(part) || (p.type && p.type !== 'none' ? p.type : ''),
+    };
+  };
+  const rowTonight = rowOf(tonight), rowTomorrow = rowOf(tomorrow);
+  const band = [...new Set([rowTonight.band, rowTomorrow.band].filter(Boolean))].join('、');
+  const bandSrc = [...new Set([rowTonight.src, rowTomorrow.src].filter(Boolean))].join('+');
+  const bandText = [...new Set([rowTonight.text, rowTomorrow.text].filter(Boolean))].join('、');
 
   const LV = { yellow: '黄色', orange: '橙色', red: '红色', blue: '蓝色' };
   const a0 = alerts[0];
@@ -4918,8 +4920,8 @@ function qWeatherFacts(steps) {
     : '无';
 
   const lines = ['【事实结论｜优先直接引用，禁止自行扫描或推算】'];
-  lines.push(`今晚 日期=${d0date} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 昼夜=${qwSpan(tonight.forecastStartTime, tonight.forecastEndTime)} 降水=${bandOf('tonight')}`);
-  lines.push(`明天 日期=${d1date} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 昼夜=${qwSpan(tomorrow.forecastStartTime, tomorrow.forecastEndTime)} 降水=${bandOf('tomorrow')}`);
+  lines.push(`今晚 日期=${d0date} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 昼夜=${spanOf(tonight)} 降水=${rowTonight.band || '无'}`);
+  lines.push(`明天 日期=${d1date} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 昼夜=${spanOf(tomorrow)} 降水=${rowTomorrow.band || '无'}`);
   // 时段就给这一串，模型原样拼在现象前面：`19-07时`。不给「今晚19时／明早7时」
   // 这种还得再加工的原子 —— 每加工一次，就多一次改编的机会。
   lines.push(`降水区间=${band || '无'} 来源=${bandSrc || '无降水'} 类型=${bandText || '无'}`);
