@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-21';
+const SMS_BUILD = 'audit-batch-22';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -452,7 +452,7 @@ const DEFAULT_SETTINGS = {
   /* AI 通知优化：任意 OpenAI 兼容接口（智谱 / DeepSeek / 硅基流动等）
      timeoutMs / maxAttempts 是「单次超时」和「最多尝试几次」，设置页可调；这里写字面量是因为
      常量 AI_TIMEOUT_MS 在文件后面才声明（const 有 TDZ，顺序不能提前引用） */
-  ai: { enabled: false, provider: '', baseUrl: '', apiKey: '', model: '', defaultPrompt: '', timeoutMs: 20000, maxAttempts: 2 },
+  ai: { enabled: false, provider: '', baseUrl: '', apiKey: '', model: '', defaultPrompt: '', timeoutMs: 20000, maxAttempts: 2, temperature: 0 },
   /*
    * 短信网关：把本机短信能力封装成对外 HTTP 接口（兼容 sms-webhook 协议），
    * 外部系统 / 转发器带 token 调 /gateway/sms/send 即可发短信，无需部署独立服务。
@@ -1912,6 +1912,8 @@ function sanitizeChannelInstances(input) {
         if (cfg.maxAttempts !== undefined && cfg.maxAttempts !== '') {
           cfg.maxAttempts = Math.min(AI_ATTEMPTS_MAX, Math.max(1, Number(cfg.maxAttempts) || AI_MAX_ATTEMPTS));
         } else { delete cfg.maxAttempts; }
+        // 0 = 同输入输出稳定（天气这类事实播报必须）；要一点变化时通过 API 调到 0~1。
+        cfg.temperature = Math.min(1, Math.max(0, Number(cfg.temperature ?? 0) || 0));
       } else {
         cfg.enabled = !!cfg.enabled;
       }
@@ -2637,6 +2639,9 @@ function aiRules(text) {
     { kind: 'no-markdown', hard: true, label: '不用 markdown 标记' },
     { kind: 'no-blank-line', hard: true, label: '不留空行' },
     { kind: 'no-filler', hard: true, label: '不写空话套话' },
+    // 前三条只管格式，管不住「-3.6~5.7°C」这种凭空拼出来的数。
+    // 数字必须能在原始内容或接口材料里逐字找到，和 system 里的事实纪律对齐。
+    { kind: 'fact-number', hard: true, label: '数字出自原始数据' },
   ];
   const per = t.match(/每行\s*[≤<]?\s*(\d{1,3})\s*字/);
   if (per) rules.push({ kind: 'line-max', n: Number(per[1]), hard: true, label: `每行 ≤${per[1]} 字` });
@@ -2652,13 +2657,29 @@ function aiRules(text) {
 const aiCharCount = (s) => [...String(s || '').replace(/\s+/g, '')].length;
 
 /** 逐条检查生成结果，返回 { msg, hard } —— 只有 hard 项才值得再花一次调用去纠正。 */
-function aiReview(body, rules) {
+function aiReview(body, rules, factText) {
   const text = String(body || '');
   const lines = text.split('\n');
   const out = [];
   const add = (msg, hard) => out.push({ msg, hard: !!hard });
   for (const r of rules) {
-    if (r.kind === 'no-markdown') {
+    if (r.kind === 'fact-number') {
+      // 没给原始内容就不判（老调用只查格式），避免把合规结果误判成幻觉。
+      if (!String(factText || '').trim()) continue;
+      // 「15-05时」里的连字符会被读成负号「-5」，先把时段与时间串抹掉；
+      // 温度区间用的是「~」，不受影响。
+      const nums = (s) => [...String(s)
+        .replace(/\d{1,2}\s*[-–]\s*\d{1,2}\s*时/g, ' ')
+        .replace(/\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2})?/g, ' ')
+        .replace(/\b\d{1,2}:\d{2}\b/g, ' ')
+        .matchAll(/-?\d+(?:\.\d+)?/g)].map((m) => Number(m[0]));
+      const allowed = new Set(nums(factText).map((n) => n.toFixed(1)));
+      // 0~24 的整数多是时段、等级、序号，原材料的时间串里遍地都是，
+      // 拿它们去卡只会误伤；小数 / 负数 / >24 才是真正需要核对的事实数字。
+      const suspects = [...new Set(nums(text).filter((n) => !Number.isInteger(n) || n < 0 || n > 24))];
+      const missing = suspects.filter((n) => !allowed.has(n.toFixed(1)));
+      if (missing.length) add(`出现原始数据里没有的数字「${missing.join('、')}」`, r.hard);
+    } else if (r.kind === 'no-markdown') {
       // 只认真正的标记：**加粗**、反引号、表格竖线、行首「- 」/「# 」。行首「-3.6」
       // 是负号不是列表，所以要求破折号后面跟空格。
       if (/\*\*|`|\|\s*\S+\s*\||^[ \t]*(?:[-*+]|#{1,6})[ \t]+/m.test(text)) add('出现了 markdown 标记', r.hard);
@@ -2748,7 +2769,10 @@ async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskNa
     const { ok, status, json, text } = await fetchJSON(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-      body: JSON.stringify({ model: cfg.model, messages: msgs, temperature: 0.35 }),
+      // 默认 0：同一份事实材料必须每次给出同一条播报。0.35 时天气任务
+      // 三次相同输入输出了三个版本（含编造的降水时段与跨口径温度）。
+      body: JSON.stringify({ model: cfg.model, messages: msgs,
+        temperature: Math.min(1, Math.max(0, Number(cfg.temperature ?? 0) || 0)) }),
       timeoutMs,
     });
     if (!ok) throw new Error(`AI 接口返回 ${status} ${text.slice(0, 120)}`);
@@ -2772,7 +2796,7 @@ async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskNa
     if (attempt > 1) await sleepMs(AI_RETRY_DELAY_MS);
     try {
       const got = await callOnce(messages);
-      const bad = aiReview(got.body, plan.rules);
+      const bad = aiReview(got.body, plan.rules, `${body || ''}\n${rawData || ''}`);
       const hardBad = bad.filter((v) => v.hard);
       if (!best || bad.length < best.violations.length) best = { ...got, violations: bad, attempts: attempt };
       // 只有硬规则（空行、markdown、空话、超长）才值得再花一次调用；emoji 数这类
@@ -4530,6 +4554,13 @@ function heuristicFacts(json) {
  *
  * 认不出形状就返回空数组，交回通用逻辑，不影响 OpenAI 风格的老任务。
  */
+/** 「2026-11-15T19:00+08:00」→「19-07时」；跨午夜连写，不拆段、不写两个「时」。 */
+function qwSpan(start, end) {
+  const a = String(start || '').slice(11, 13);
+  const b = String(end || '').slice(11, 13);
+  return a && b ? `${a}-${b}时` : '';
+}
+
 function summarizeQWeatherStep(j) {
   const lines = [];
   const n1 = (v, unit = '') => (v == null || v === '' ? '' : `${Math.round(Number(v) * 10) / 10}${unit}`);
@@ -4558,8 +4589,11 @@ function summarizeQWeatherStep(j) {
     if (o.wind) bits.push(`风=${wind(o.wind)}`);
     if (o.precipitation) {
       const p = o.precipitation;
-      if (p.type && p.type !== 'none') bits.push(`降水=${p.type}${n1(p.amount && p.amount.value, 'mm')}`);
-      if (p.probability != null) bits.push(`降水概率=${pct(p.probability)}`);
+      // 每条都写明降水量/类型/概率：以前只在「有降水」时输出，AI 看到 24 行里
+      // 没有任何降水字段，却要按提示词扫出降水区间，只能自己编一个时段。
+      bits.push(`降水量=${n1(p.amount && p.amount.value, 'mm') || '0mm'}`);
+      bits.push(`降水类型=${p.type && p.type !== 'none' ? p.type : '无'}`);
+      bits.push(`降水概率=${p.probability != null ? pct(p.probability) : '0%'}`);
     }
     if (o.uvIndex != null) bits.push(`紫外线=${o.uvIndex}`);
     return bits.join(' ');
@@ -4580,7 +4614,11 @@ function summarizeQWeatherStep(j) {
       if (d.temperatureMax) bits.push(`全天最高=${n1(d.temperatureMax.value, '°C')}`);
       if (cond(day.condition)) bits.push(`白天=${cond(day.condition)}`);
       if (cond(night.condition)) bits.push(`夜间=${cond(night.condition)}`);
-      if (night.temperatureMin) bits.push(`夜间最低=${n1(night.temperatureMin.value, '°C')}`);
+      if (qwSpan(day.forecastStartTime, day.forecastEndTime)) bits.push(`白天时段=${qwSpan(day.forecastStartTime, day.forecastEndTime)}`);
+      if (qwSpan(night.forecastStartTime, night.forecastEndTime)) bits.push(`夜间时段=${qwSpan(night.forecastStartTime, night.forecastEndTime)}`);
+      // 口径标注：以前「全天最低」和「夜间最低」并列，模型会把明天的夜间最低
+      // 拿去当明天温度区间下端，拼出「-3.6~5.7°C」这种跨口径结果。
+      if (night.temperatureMin) bits.push(`夜间最低（${i === 0 ? '今晚行用' : '禁用于明天温度区间'}）=${n1(night.temperatureMin.value, '°C')}`);
       if (day.wind) bits.push(`白天风=${wind(day.wind)}`);
       if (day.precipitation) {
         const p = day.precipitation;
@@ -4593,11 +4631,11 @@ function summarizeQWeatherStep(j) {
     });
   }
 
-  // ③ 逐小时：只抽关键时段，24 条全给会把提示词撑爆
+  // ③ 逐小时：24 条全给。以前只抽 8 个采样点，但任务提示词要求「逐条扫描
+  // hourly 全部 24 条算降水起止」，模型做不到就只能编时段（实测同一份数据
+  // 连出 15-05时 / 02-08时）。24 行约 2.5KB，材料上限早已放到 RESULT_BODY_MAX。
   if (Array.isArray(j.hours)) {
-    const KEY = new Set(['20:00', '23:00', '02:00', '05:00', '08:00', '11:00', '14:00', '17:00']);
     for (const h of j.hours) {
-      if (!KEY.has(String(h.forecastTime || '').slice(11, 16))) continue;
       lines.push(`hourly ${String(h.forecastTime || '').slice(5, 16)} ${point(h)}`);
     }
   }
@@ -4618,6 +4656,70 @@ function summarizeQWeatherStep(j) {
     lines.push(`空气质量 AQI=${i0.aqi} 等级=${i0.category || ''}`);
   }
 
+  return lines;
+}
+
+/**
+ * 和风 v1 的跨步骤「事实结论」：今晚 / 明天 / 降水区间 / 预警由服务端算好再交给 AI。
+ * 以前模型要在 24 行 hourly 和「全天最低 / 夜间最低」多个口径之间自己挑，
+ * 挑错就表现为同一份数据每次播报不同（11-15 实测三条全不一样）。
+ * 只在给 AI 的全量材料里追加；通知栏 600 字兜底摘要不受影响。
+ */
+function qWeatherFacts(steps) {
+  const arr = Array.isArray(steps) ? steps : [];
+  const pick = (key) => {
+    for (const s of arr) {
+      const j = s && s.json;
+      if (j && typeof j === 'object' && Array.isArray(j[key])) return j[key];
+    }
+    return [];
+  };
+  const days = pick('days');
+  if (!days.length) return [];
+  const hours = pick('hours');
+  const alerts = pick('alerts');
+  const indexes = pick('indexes');
+  const n1 = (v, u = '') => (v == null || v === '' ? '' : `${Math.round(Number(v) * 10) / 10}${u}`);
+  const cond = (o) => (o && o.condition && o.condition.text) || '';
+  const d0 = days[0] || {}, d1 = days[1] || {};
+  const tonight = d0.nighttime || {}, tomorrow = d1.daytime || {}, tomorrowNight = d1.nighttime || {};
+
+  // 降水区间：先扫逐小时的最早/最晚降水小时；hourly 没覆盖到就退逐日的白天/夜间时段。
+  const wet = hours.filter((h) => /[雨雪]/.test(cond(h))
+    || Number((h.precipitation && h.precipitation.amount && h.precipitation.amount.value) || 0) > 0);
+  let band = '', bandSrc = '', bandText = '';
+  if (wet.length) {
+    const hh = (h) => String(h.forecastTime || '').slice(11, 13);
+    band = `${hh(wet[0])}-${hh(wet[wet.length - 1])}时`;
+    bandSrc = '逐小时';
+    bandText = cond(wet.find((h) => /雪/.test(cond(h))) || wet.find((h) => /雨/.test(cond(h))) || wet[0]);
+  } else {
+    const cands = [
+      { part: tonight, label: '今晚夜间' },
+      { part: tomorrow, label: '明天白天' },
+      { part: tomorrowNight, label: '明天夜间' },
+    ];
+    for (const c of cands) {
+      const p = (c.part && c.part.precipitation) || {};
+      const has = (p.type && p.type !== 'none') || Number((p.amount && p.amount.value) || 0) > 0
+        || Number(p.probability || 0) >= 0.6;
+      if (!has) continue;
+      band = qwSpan(c.part.forecastStartTime, c.part.forecastEndTime);
+      bandSrc = `${c.label}/逐日`;
+      bandText = cond(c.part) || (p.type && p.type !== 'none' ? p.type : '');
+      break;
+    }
+  }
+
+  const lines = ['【事实结论｜优先直接引用，禁止自行扫描或推算】'];
+  lines.push(`今晚 日期=${String(d0.forecastStartTime || '').slice(0, 10)} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 时段=${qwSpan(tonight.forecastStartTime, tonight.forecastEndTime)}`);
+  lines.push(`明天 日期=${String(d1.forecastStartTime || '').slice(0, 10)} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 时段=${qwSpan(tomorrow.forecastStartTime, tomorrow.forecastEndTime)}`);
+  lines.push(`降水区间=${band || '无'} 来源=${bandSrc || '无降水'} 类型=${bandText || '无'}`);
+  const a0 = alerts[0];
+  lines.push(a0
+    ? `预警=${(a0.eventType && a0.eventType.name) || ''}/${(a0.color && a0.color.code) || ''} 摘要=${String(a0.headline || '').slice(0, 30)}`
+    : '预警=无');
+  if (indexes.length) lines.push(`空气质量 AQI=${indexes[0].aqi} 等级=${indexes[0].category || ''}`);
   return lines;
 }
 
@@ -4711,6 +4813,8 @@ function summarizeStepData(steps, cap) {
       if (raw && raw.length > 2) out.push(`${tag} 响应 ${raw}`);
     }
   }
+  // 事实结论只追加到给 AI 的全量材料；带 cap 的是通知栏兜底摘要，别把正文挤掉。
+  if (cap == null) out.push(...qWeatherFacts(steps));
   const text = out.join('\n');
   return limit > 0 && text.length > limit ? text.slice(0, limit) + '\n…（数据已截断）' : text;
 }
@@ -7217,6 +7321,7 @@ async function handleApi(req, res, url) {
     if (next.ai) {
       next.ai.timeoutMs = Math.min(AI_TIMEOUT_MAX, Math.max(AI_TIMEOUT_MIN, Number(next.ai.timeoutMs) || AI_TIMEOUT_MS));
       next.ai.maxAttempts = Math.min(AI_ATTEMPTS_MAX, Math.max(1, Number(next.ai.maxAttempts) || AI_MAX_ATTEMPTS));
+      next.ai.temperature = Math.min(1, Math.max(0, Number(next.ai.temperature ?? 0) || 0));
     }
     // 短信网关：启用但还没令牌时自动生成一个；令牌只在这里管理，不做掩码（属主自己用的凭据）
     if (next.gatewaySms) {
