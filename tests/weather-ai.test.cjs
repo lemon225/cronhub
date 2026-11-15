@@ -186,6 +186,29 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     A.aiReview('❄️ 今晚小雪，最低-9.9°C', rules).length === 0);
   ok('默认 temperature 为 0', /ai: \{[^}]*temperature: 0 \}/.test(SRC));
 
+  console.log('\n[4a] 只提取不编造：结论区外的天气词 / 时段 / 预警级别硬拦');
+  const srcPrompt = '只输出 3 行；正文 ≤58 字；只从【事实结论】区提取。';
+  const rSrc = A.aiRules(srcPrompt);
+  ok('只有写了「事实结论」的任务才启用 fact-source',
+    rSrc.some((r) => r.kind === 'fact-source' && r.hard)
+      && !A.aiRules('正文 ≤58 字').some((r) => r.kind === 'fact-source'), rSrc);
+  const srcFacts = '【事实结论｜优先直接引用】\n今晚 现象=多云 最低=-1.5°C 降水时段=无\n'
+    + '明天 现象=小雪 最低=-1.5°C 最高=6.3°C 降水时段=07-19时\n预警名=道路结冰黄色预警';
+  ok('逐字引用结论区零违规',
+    A.aiReview('❄️ 今晚多云，最低-1.5°C\n⛅ 明天07-19时小雪，-1.5°C~6.3°C\n'
+      + '⚠️ 道路结冰黄色预警；明早慢行', rSrc, srcFacts).length === 0);
+  const fakeWeather = A.aiReview(
+    '❄️ 今晚18-22时雨夹雪\n⛅ 明天05-19时雪\n⚠️ 道路结冰橙色预警；明早慢行', rSrc, srcFacts);
+  ok('编造时段 / 现象 / 预警级别被标为 hard',
+    fakeWeather.some((v) => v.hard && v.msg.includes('事实结论区没有')), fakeWeather);
+  ok('允许放弃字段：不写时段与温度仍零违规',
+    A.aiReview('❄️ 今晚多云\n⛅ 明天小雪\n🧣 明早慢行', rSrc, srcFacts).length === 0);
+  ok('材料无结论区时固定降级三行零违规',
+    A.aiReview('❄️ 数据不足\n⛅ 本次不播报\n💡 稍后重试', rSrc, '[[实况] 成功 HTTP 200').length === 0);
+  ok('材料无结论区却写天气内容被拦',
+    A.aiReview('❄️ 今晚18-22时雨夹雪\n⛅ 明天05-19时雪\n⚠️ 道路结冰橙色预警；明早慢行',
+      rSrc, '[[实况] 成功 HTTP 200').some((v) => v.hard && v.msg.includes('没有【事实结论】区')));
+
   console.log('\n[4b] 图标全篇不重复：机检留痕 + 服务端确定性归一');
   const iconPrompt = '只输出 3 行；正文 ≤58 字；图标全篇不重复。今晚行：❄️ 明天行：⛅ 建议行：🧣 预警 ⚠️';
   const rIcon = A.aiRules(iconPrompt);
@@ -209,12 +232,14 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     req.on('data', (d) => { raw += d.toString(); });
     req.on('end', () => {
       seen.push(raw);
-      // 第一次故意编数字触发纠正；第二次给「合规但 °C 前带空格、前两行图标重复」
-      // 的版本，验证服务端会按任务要求做两处确定性归一。
+      // 第 1 次编数字、第 2 次编天气词与时段，各触发一次纠正；第 3 次给合规版
+      // （°C 前带空格、前两行图标重复），验证两处确定性归一。
       const goodSpaced = '❄️ 今晚多云，最低-1.4 °C\n❄️ 明天07-19时小雪-1.9~5.7 °C\n⚠️ 道路结冰黄色预警；明早慢行';
       const body = seen.length === 1
         ? '❄️ 今晚小雪，最低-9.9°C\n⛅ 明天晴间多云，-3.6~5.7°C'
-        : goodSpaced;
+        : seen.length === 2
+          ? '❄️ 今晚18-22时雨夹雪\n⛅ 明天05-19时雪\n⚠️ 道路结冰橙色预警；明早慢行'
+          : goodSpaced;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ title: 't', body }) } }] }));
     });
@@ -234,7 +259,8 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     schedules: [{ mode: 'cron', cron: '0 19 * * *' }], schedule: { mode: 'cron', cron: '0 19 * * *' },
     config: {
       url: u('current'), method: 'GET', expectStatus: 200, timeoutSec: 8,
-      notifyPrompt: '只输出 3 行；正文 ≤58 字；数字必须出自原始数据；°C 紧贴数字；图标全篇不重复。'
+      notifyPrompt: '只输出 3 行；正文 ≤58 字；只从【事实结论】区提取，禁止编造；'
+        + '数字必须出自原始数据；°C 紧贴数字；图标全篇不重复。'
         + '今晚行：❄️ 明天行：⛅ 建议行：🧣 预警 ⚠️',
       notify: { enabled: true, channels: [] },
       steps: NAMES.map((n) => ({ name: n, url: u(n), method: 'GET' })),
@@ -249,7 +275,7 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
       missedPolicy: 'skip',
       ai: { enabled: true, provider: 'openai', model: 'mock-model', apiKey: 'mock-key',
         baseUrl: `http://127.0.0.1:${ai.address().port}/v1`,
-        defaultPrompt: '', timeoutMs: 20000, maxAttempts: 2, temperature: 0 },
+        defaultPrompt: '', timeoutMs: 20000, maxAttempts: 3, temperature: 0 },
     },
     smsRelay: [], keepAliveLog: [], auth: null, authLog: [], systemLogs: [],
     deadLetters: [], smsRecords: [],
@@ -290,15 +316,20 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
       ok('AI 收到 24 行 hourly', user1 && (user1.content.match(/hourly /g) || []).length === 24,
         user1 && (user1.content.match(/hourly /g) || []).length);
       ok('AI 收到事实结论行', user1 && user1.content.includes('【事实结论'));
-      ok('编造数字触发第二次纠正调用', seen.length === 2, seen.length);
-      if (seen.length === 2) {
+      ok('两次硬违规各触发一次纠正，共 3 次调用', seen.length === 3, seen.length);
+      if (seen.length >= 2) {
         const req2 = JSON.parse(seen[1]);
-        ok('纠正消息点名违规数字',
+        ok('第一次纠正点名违规数字',
           JSON.stringify(req2.messages).includes('没通过检查') && JSON.stringify(req2.messages).includes('-9.9'));
+      }
+      if (seen.length >= 3) {
+        const req3 = JSON.parse(seen[2]);
+        ok('第二次纠正点名编造的天气内容',
+          JSON.stringify(req3.messages).includes('事实结论区没有的内容'), JSON.stringify(req3.messages).slice(-500));
       }
       ok('最终正文为纠正后的合规版本，°C 与重复图标都被确定性归一',
         notes[0] && notes[0].body === good, notes[0] && notes[0].body);
-      ok('aiNote 显示 7 项校验', notes[0] && /已校验 7 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
+      ok('aiNote 显示 8 项校验', notes[0] && /已校验 8 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
       ok('通知原文附上 AI 依据的接口数据（事实结论 + 24 行 hourly）',
         notes[0] && /【AI 依据的接口数据】/.test(notes[0].rawBody || '')
           && /【事实结论/.test(notes[0].rawBody || '')
@@ -315,7 +346,7 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
         st2 = await (await fetch(base + '/api/state')).json();
         if ((st2.notifications || []).length >= 2) break;
       }
-      ok('第二次执行复用 AI 结果，未新增模型调用', seen.length === 2, seen.length);
+      ok('第二次执行复用 AI 结果，未新增模型调用', seen.length === 3, seen.length);
       ok('两次通知正文完全一致',
         st2 && st2.notifications[0].body === st2.notifications[1].body,
         st2 && [st2.notifications[0].body, st2.notifications[1].body]);

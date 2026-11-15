@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-25';
+const SMS_BUILD = 'audit-batch-26';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2656,6 +2656,12 @@ function aiRules(text) {
   if (/全篇\s*不重复|图标[^。\n]*不重复|不重复[^。\n]*图标/.test(t)) {
     rules.push({ kind: 'unique-icon', hard: false, label: '图标全篇不重复' });
   }
+  // 天气播报类任务才启用：结论区是唯一事实来源，编造的现象词 / 时段 / 预警级别
+  // 必须能机检出来，否则「数字出自原始数据」只查小数，拦不住「18-22时雨夹雪」。
+  // 其它任务（油价、热评、自检）的提示词不含这四个字，完全不受影响。
+  if (/事实结论/.test(t)) {
+    rules.push({ kind: 'fact-source', hard: true, label: '天气词 / 时段 / 预警出自结论区' });
+  }
   return rules;
 }
 
@@ -2718,6 +2724,28 @@ function aiReview(body, rules, factText) {
       const suspects = [...new Set(nums(text).filter((n) => !Number.isInteger(n) || n < 0 || n > 24))];
       const missing = suspects.filter((n) => !allowed.has(n.toFixed(1)));
       if (missing.length) add(`出现原始数据里没有的数字「${missing.join('、')}」`, r.hard);
+    } else if (r.kind === 'fact-source') {
+      /*
+       * 只查「有没有写出材料里不存在的东西」，不查「该写的有没有写」——
+       * 后者正是要允许的「放弃部分数据」，反查会逼模型凑字段、重新编一个。
+       * 材料里没有【事实结论】区时，正文出现任何天气内容都按编造处理。
+       */
+      const ft = String(factText || '');
+      const hasFacts = /【事实结论/.test(ft);
+      const WORDS = /(雨夹雪|小雪|中雪|大雪|暴雪|阵雪|雷阵雨|阵雨|小雨|中雨|大雨|暴雨|晴间多云|多云|少云|阴天|阴|晴|雾|霾|沙尘|冰雹|霜冻|道路结冰|寒潮|大风|雪|雨)/g;
+      const words = [...new Set([...text.matchAll(WORDS)].map((m) => m[1]))];
+      const bands = [...new Set([...text.matchAll(/\d{1,2}-\d{1,2}时/g)].map((m) => m[0]))];
+      const levels = [...new Set([...text.matchAll(/(蓝色|黄色|橙色|红色)预警/g)].map((m) => m[1]))];
+      if (!hasFacts && (words.length || bands.length || levels.length)) {
+        add('材料没有【事实结论】区，正文却写了天气内容', r.hard);
+      } else if (hasFacts) {
+        const missing = [...new Set([
+          ...words.filter((w) => !ft.includes(w)),
+          ...bands.filter((b) => !ft.includes(b)),
+          ...levels.filter((l) => !ft.includes(l)),
+        ])];
+        if (missing.length) add(`出现事实结论区没有的内容「${missing.slice(0, 3).join('、')}」`, r.hard);
+      }
     } else if (r.kind === 'no-markdown') {
       // 只认真正的标记：**加粗**、反引号、表格竖线、行首「- 」/「# 」。行首「-3.6」
       // 是负号不是列表，所以要求破折号后面跟空格。
@@ -2886,10 +2914,10 @@ async function aiPolish(cfg, opts) {
       if (!hardBad.length) break;
       /*
        * 不达标就纠正一次：把上一版和「具体违反了哪一条」一起回灌，只让它修这些点。
-       * 不再多给轮次 —— 通知是时效消息，最多两次调用（默认 attempts=2）已是上限；
-       * 纠正后仍不达标就照发，但要如实把违规项写进 aiNote，让人看得见。
+       * 纠正次数 = maxAttempts - 1（设 3 就是「重试 2 次」），次数用完仍不达标
+       * 就照发违规最少的那版，并如实把违规项写进 aiNote，让人看得见。
        */
-      if (attempt === 1 && maxAttempts >= 2) {
+      if (attempt < maxAttempts) {
         messages.push({ role: 'assistant', content: JSON.stringify({ title: got.title, body: got.body }) });
         messages.push({
           role: 'user',
