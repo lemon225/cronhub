@@ -178,6 +178,27 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   dry.daily.days[1].daytime.precipitation = { amount: { value: 0 }, type: 'none', probability: 0 };
   const dryFacts = W.qWeatherFacts(stepsOf(dry, NAMES));
   ok('全无降水时写「无」', dryFacts.some((l) => l.includes('降水区间=无')), dryFacts);
+  // 白天多云、明天夜里下雪：以前第二行只看 d1.daytime，整段雨雪消失，
+  // 通知写成「明天多云」——冬天最常见的一种漏报。
+  const nightOnly = qwFixture();
+  nightOnly.daily.days[1].daytime = {
+    ...nightOnly.daily.days[1].daytime,
+    condition: { text: '多云' },
+    precipitation: { amount: { value: 0 }, type: 'none', probability: 0 },
+  };
+  nightOnly.daily.days[1].nighttime = {
+    ...nightOnly.daily.days[1].nighttime,
+    condition: { text: '中雪' },
+    precipitation: { amount: { value: 0.6 }, type: 'snow', probability: 0.8 },
+  };
+  const nf = W.qWeatherFacts(stepsOf(nightOnly, NAMES));
+  ok('白天没降水时，明天行退回明天夜间并换用夜间现象',
+    nf.some((l) => l.startsWith('明天 ') && l.includes('现象=中雪')
+      && l.includes('降水=19-07时') && l.includes('昼夜=19-07时')), nf);
+  ok('退回夜间后降水区间只留这一段',
+    nf.some((l) => l.includes('降水区间=19-07时') && l.includes('类型=中雪')), nf);
+  ok('夜间温度不并进明天区间（仍取全天最低/最高）',
+    nf.some((l) => l.startsWith('明天 ') && l.includes('最低=-1.9°C') && l.includes('最高=5.7°C')), nf);
   ok('非和风数据不追加结论',
     W.qWeatherFacts([{ name: 'x', ok: true, json: { hello: 'world' } }]).length === 0);
   ok('通知栏兜底摘要（cap=600）不追加结论',

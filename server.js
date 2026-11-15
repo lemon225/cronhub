@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-31';
+const SMS_BUILD = 'audit-batch-32';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -4911,7 +4911,20 @@ function qWeatherFacts(steps) {
       text: cond(part) || (p.type && p.type !== 'none' ? p.type : ''),
     };
   };
-  const rowTonight = rowOf(tonight), rowTomorrow = rowOf(tomorrow);
+  const rowTonight = rowOf(tonight);
+  /*
+   * 明天行先看白天（07-19），白天没有降水再看明天夜间（19-07）。
+   * 以前只取 d1.daytime，明天晚上到后天早上的雨雪整段消失 —— 冬天夜里下雪、
+   * 白天多云是最常见的一种，通知却写「明天无雨雪」。退回夜间时现象也要跟着
+   * 换成夜间那条，否则会拼出「明天19-07时多云」这种自相矛盾的句子。
+   * 温度仍取全天极值（白天那份），夜间缺最高，混着取会把区间砍成半个。
+   */
+  let rowTomorrow = rowOf(tomorrow);
+  let tmrPart = tomorrow;
+  if (!rowTomorrow.band) {
+    const night1 = rowOf(d1.nighttime);
+    if (night1.band) { rowTomorrow = night1; tmrPart = d1.nighttime; }
+  }
   const band = [...new Set([rowTonight.band, rowTomorrow.band].filter(Boolean))].join('、');
   const bandSrc = [...new Set([rowTonight.src, rowTomorrow.src].filter(Boolean))].join('+');
   const bandText = [...new Set([rowTonight.text, rowTomorrow.text].filter(Boolean))].join('、');
@@ -4925,7 +4938,7 @@ function qWeatherFacts(steps) {
 
   const lines = ['【事实结论｜优先直接引用，禁止自行扫描或推算】'];
   lines.push(`今晚 日期=${d0date} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 昼夜=${spanOf(tonight)} 降水=${rowTonight.band || '无'}`);
-  lines.push(`明天 日期=${d1date} 现象=${cond(tomorrow)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 昼夜=${spanOf(tomorrow)} 降水=${rowTomorrow.band || '无'}`);
+  lines.push(`明天 日期=${d1date} 现象=${cond(tmrPart)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 昼夜=${spanOf(tmrPart)} 降水=${rowTomorrow.band || '无'}`);
   // 时段就给这一串，模型原样拼在现象前面：`19-07时`。不给「今晚19时／明早7时」
   // 这种还得再加工的原子 —— 每加工一次，就多一次改编的机会。
   lines.push(`降水区间=${band || '无'} 来源=${bandSrc || '无降水'} 类型=${bandText || '无'}`);
