@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-22c';
+const SMS_BUILD = 'audit-batch-22d';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2645,6 +2645,9 @@ function aiRules(text) {
   ];
   const per = t.match(/每行\s*[≤<]?\s*(\d{1,3})\s*字/);
   if (per) rules.push({ kind: 'line-max', n: Number(per[1]), hard: true, label: `每行 ≤${per[1]} 字` });
+  // 「只输出 3 行正文」以前只是提示词里的一句话，模型少输出一整行也照发。
+  const cnt = t.match(/只输出\s*(\d{1,2})\s*行/);
+  if (cnt) rules.push({ kind: 'line-count', n: Number(cnt[1]), hard: true, label: `正好 ${cnt[1]} 行` });
   const tot = t.match(/(?:正文|全篇|全文|整体|总字数)\s*[≤<]?\s*(\d{2,4})\s*字/);
   if (tot) rules.push({ kind: 'total-max', n: Number(tot[1]), hard: true, label: `正文 ≤${tot[1]} 字` });
   if (/每行\s*(?:1|一)\s*个\s*emoji|每行一个\s*emoji/i.test(t)) {
@@ -2688,6 +2691,9 @@ function aiReview(body, rules, factText) {
     } else if (r.kind === 'no-filler') {
       const hit = text.match(/关注后续|保持积极心态|注意安全|合理安排|希望对你有帮助|仅供参考|祝您|祝你/);
       if (hit) add(`出现空话「${hit[0]}」`, r.hard);
+    } else if (r.kind === 'line-count') {
+      const n = text.trim() ? text.trim().split('\n').filter((l) => l.trim()).length : 0;
+      if (n !== r.n) add(`输出 ${n} 行，应为 ${r.n} 行`, r.hard);
     } else if (r.kind === 'line-max') {
       const i = lines.findIndex((l) => aiCharCount(l) > r.n);
       if (i >= 0) add(`第 ${i + 1} 行 ${aiCharCount(lines[i])} 字，超过每行 ${r.n} 字`, r.hard);
@@ -2753,8 +2759,31 @@ function aiPrompts({ instruction, taskInstruction, taskName, title, body, rawDat
   return { system: sys, user, rules: aiRules(`${taskNeed}\n${defaultNeed}`), taskNeed, defaultNeed };
 }
 
-async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskName, rawData }) {
+/* 同一份事实材料在短时间内重复执行时，复用上一次 AI 结果。
+ * 模型即使 temperature=0 也会在图标、行数、措辞上抖动，用户看到的就是
+ * 「几分钟内几条通知内容不一样」。材料变了（预报刷新）才重新生成。
+ * 和风类任务用「事实结论」区做指纹：逐小时窗口整体前移不改变结论，
+ * 不该因此再摇一次模型；没有结论区的任务退回规范化后的全量材料。 */
+const AI_POLISH_TTL_MS = 30 * 60 * 1000;
+const AI_POLISH_CACHE = new Map();
+function aiPolishKey({ taskName, body, instruction, taskInstruction, rawData }) {
+  const raw = String(rawData || '');
+  const at = raw.indexOf('【事实结论');
+  const facts = at >= 0
+    ? raw.slice(at)
+    : raw.replace(/"tag"\s*:\s*"[^"]*"/g, '')
+      .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?/g, 'T');
+  return crypto.createHash('sha1')
+    .update([taskName, instruction, taskInstruction, body, facts].join('\n'))
+    .digest('hex');
+}
+
+async function aiPolish(cfg, opts) {
+  const { title, body, instruction, taskInstruction, taskName, rawData } = opts;
   if (!cfg || !cfg.baseUrl || !cfg.apiKey || !cfg.model) throw new Error('AI 未配置完整（需接口地址 / API Key / 模型）');
+  const cacheKey = aiPolishKey(opts);
+  const cached = AI_POLISH_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.at < AI_POLISH_TTL_MS) return { ...cached.result, cached: true };
   const timeoutMs = Math.min(AI_TIMEOUT_MAX, Math.max(AI_TIMEOUT_MIN, Number(cfg.timeoutMs) || AI_TIMEOUT_MS));
   const maxAttempts = Math.min(AI_ATTEMPTS_MAX, Math.max(1, Number(cfg.maxAttempts) || AI_MAX_ATTEMPTS));
   const url = cfg.baseUrl.replace(/\/+$/, '') + '/chat/completions';
@@ -2825,7 +2854,7 @@ async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskNa
     }
   }
   if (!best) throw lastErr || new Error('AI 未返回可用结果');
-  return {
+  const result = {
     title: best.title,
     body: best.body,
     attempts: best.attempts,
@@ -2833,6 +2862,9 @@ async function aiPolish(cfg, { title, body, instruction, taskInstruction, taskNa
     violations: best.violations,
     checks: plan.rules.length,
   };
+  AI_POLISH_CACHE.set(cacheKey, { at: Date.now(), result });
+  if (AI_POLISH_CACHE.size > 200) AI_POLISH_CACHE.delete(AI_POLISH_CACHE.keys().next().value);
+  return result;
 }
 
 

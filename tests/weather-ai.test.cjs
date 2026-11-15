@@ -169,6 +169,11 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   console.log('\n[4] 数值事实校验：编造数字硬拦，时段与合规数字不误伤');
   const rules = A.aiRules('正文 ≤58 字');
   ok('规则含 fact-number，共 5 项', rules.length === 5 && rules.some((r) => r.kind === 'fact-number'), rules);
+  const rules3 = A.aiRules('只输出 3 行正文；正文 ≤58 字');
+  ok('「只输出 3 行」可机检', rules3.some((r) => r.kind === 'line-count' && r.n === 3 && r.hard), rules3);
+  ok('少输出一行会被拦下',
+    A.aiReview('❄️ 今晚多云，最低-1.4°C\n⚠️ 道路结冰黄色预警；明早慢行', rules3, text)
+      .some((v) => v.hard && v.msg.includes('2 行')));
   const good = '❄️ 今晚多云，最低-1.4°C\n⛅ 明天07-19时小雪-1.9~5.7°C\n⚠️ 道路结冰黄色预警；明早慢行';
   ok('合规三行零违规', A.aiReview(good, rules, text).length === 0, A.aiReview(good, rules, text));
   ok('跨午夜时段 22-03时 不被读成负数',
@@ -275,7 +280,21 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
       }
       ok('最终正文为纠正后的合规版本，且 °C 前的空格被确定性归一',
         notes[0] && notes[0].body === good, notes[0] && notes[0].body);
-      ok('aiNote 显示 5 项校验', notes[0] && /已校验 5 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
+      ok('aiNote 显示 6 项校验', notes[0] && /已校验 6 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
+
+      // 同一份事实材料再跑一次：结果应从缓存复用，不再摇一次模型。
+      await sleep(600);
+      await fetch(base + '/api/tasks/t_weather/run', { method: 'POST' });
+      let st2 = null;
+      for (let i = 0; i < 100; i++) {
+        await sleep(200);
+        st2 = await (await fetch(base + '/api/state')).json();
+        if ((st2.notifications || []).length >= 2) break;
+      }
+      ok('第二次执行复用 AI 结果，未新增模型调用', seen.length === 2, seen.length);
+      ok('两次通知正文完全一致',
+        st2 && st2.notifications[0].body === st2.notifications[1].body,
+        st2 && [st2.notifications[0].body, st2.notifications[1].body]);
     }
   } finally {
     child.kill();
