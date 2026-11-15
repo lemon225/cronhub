@@ -43,7 +43,8 @@ function pure(blockStart, blockEnd, prefix, names) {
 }
 const W = pure('function qwSpan(', '/**\n * 生成推送内容',
   'const RESULT_BODY_MAX=200000;', ['qwSpan', 'summarizeQWeatherStep', 'qWeatherFacts', 'summarizeStepData']);
-const A = pure('function aiRules(', '/**\n * 拼装提示词', '', ['aiRules', 'aiReview']);
+const A = pure('function aiRules(', '/**\n * 拼装提示词', '',
+  ['aiRules', 'aiReview', 'aiIconPool', 'dedupeIcons']);
 
 function hour(day, h, text, precip) {
   return {
@@ -185,6 +186,22 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     A.aiReview('❄️ 今晚小雪，最低-9.9°C', rules).length === 0);
   ok('默认 temperature 为 0', /ai: \{[^}]*temperature: 0 \}/.test(SRC));
 
+  console.log('\n[4b] 图标全篇不重复：机检留痕 + 服务端确定性归一');
+  const iconPrompt = '只输出 3 行；正文 ≤58 字；图标全篇不重复。今晚行：❄️ 明天行：⛅ 建议行：🧣 预警 ⚠️';
+  const rIcon = A.aiRules(iconPrompt);
+  ok('「全篇不重复」进规则且仍是软规则（不触发无效重试）',
+    rIcon.some((r) => r.kind === 'unique-icon' && r.hard === false), rIcon);
+  ok('没写这条要求的任务不受影响', !A.aiRules('正文 ≤58 字').some((r) => r.kind === 'unique-icon'));
+  const pool = A.aiIconPool(iconPrompt);
+  ok('图标池按任务行模板优先', pool.slice(0, 3).join('|') === '❄️|⛅|🧣', pool.slice(0, 5));
+  const dup = '❄️ 今晚多云，最低-1.4°C\n❄️ 明天小雪，-1.9~5.7°C\n❄️ 明早慢行';
+  ok('重复图标被机检点名', A.aiReview(dup, rIcon, text).some((v) => v.msg.includes('重复') && !v.hard));
+  const fixed = A.dedupeIcons(dup, pool);
+  ok('归一后三行图标互不相同且正文不动',
+    fixed === '❄️ 今晚多云，最低-1.4°C\n⛅ 明天小雪，-1.9~5.7°C\n🧣 明早慢行', fixed);
+  ok('归一后机检零违规', A.aiReview(fixed, rIcon, text).length === 0);
+  ok('带 / 不带 VS16 视为同一图标', /⚠️ 一\n(?!⚠)/u.test(A.dedupeIcons('⚠️ 一\n⚠ 二', pool)));
+
   console.log('\n[5] 端到端：真服务 + mock AI 抓请求体，验证 temperature 与纠正链路');
   const seen = [];
   const ai = http.createServer((req, res) => {
@@ -192,9 +209,9 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     req.on('data', (d) => { raw += d.toString(); });
     req.on('end', () => {
       seen.push(raw);
-      // 第一次故意编数字触发纠正；第二次给「合规但 °C 前带空格」的版本，
-      // 用来验证服务端会按任务要求做确定性归一。
-      const goodSpaced = '❄️ 今晚多云，最低-1.4 °C\n⛅ 明天07-19时小雪-1.9~5.7 °C\n⚠️ 道路结冰黄色预警；明早慢行';
+      // 第一次故意编数字触发纠正；第二次给「合规但 °C 前带空格、前两行图标重复」
+      // 的版本，验证服务端会按任务要求做两处确定性归一。
+      const goodSpaced = '❄️ 今晚多云，最低-1.4 °C\n❄️ 明天07-19时小雪-1.9~5.7 °C\n⚠️ 道路结冰黄色预警；明早慢行';
       const body = seen.length === 1
         ? '❄️ 今晚小雪，最低-9.9°C\n⛅ 明天晴间多云，-3.6~5.7°C'
         : goodSpaced;
@@ -217,7 +234,8 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
     schedules: [{ mode: 'cron', cron: '0 19 * * *' }], schedule: { mode: 'cron', cron: '0 19 * * *' },
     config: {
       url: u('current'), method: 'GET', expectStatus: 200, timeoutSec: 8,
-      notifyPrompt: '只输出 3 行；正文 ≤58 字；数字必须出自原始数据；°C 紧贴数字。',
+      notifyPrompt: '只输出 3 行；正文 ≤58 字；数字必须出自原始数据；°C 紧贴数字；图标全篇不重复。'
+        + '今晚行：❄️ 明天行：⛅ 建议行：🧣 预警 ⚠️',
       notify: { enabled: true, channels: [] },
       steps: NAMES.map((n) => ({ name: n, url: u(n), method: 'GET' })),
     },
@@ -278,9 +296,15 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
         ok('纠正消息点名违规数字',
           JSON.stringify(req2.messages).includes('没通过检查') && JSON.stringify(req2.messages).includes('-9.9'));
       }
-      ok('最终正文为纠正后的合规版本，且 °C 前的空格被确定性归一',
+      ok('最终正文为纠正后的合规版本，°C 与重复图标都被确定性归一',
         notes[0] && notes[0].body === good, notes[0] && notes[0].body);
-      ok('aiNote 显示 6 项校验', notes[0] && /已校验 6 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
+      ok('aiNote 显示 7 项校验', notes[0] && /已校验 7 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
+      ok('通知原文附上 AI 依据的接口数据（事实结论 + 24 行 hourly）',
+        notes[0] && /【AI 依据的接口数据】/.test(notes[0].rawBody || '')
+          && /【事实结论/.test(notes[0].rawBody || '')
+          && (notes[0].rawBody.match(/hourly /g) || []).length === 24,
+        notes[0] && { len: (notes[0].rawBody || '').length,
+          hourly: (notes[0].rawBody.match(/hourly /g) || []).length });
 
       // 同一份事实材料再跑一次：结果应从缓存复用，不再摇一次模型。
       await sleep(600);

@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-22d';
+const SMS_BUILD = 'audit-batch-22e';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -2653,11 +2653,47 @@ function aiRules(text) {
   if (/每行\s*(?:1|一)\s*个\s*emoji|每行一个\s*emoji/i.test(t)) {
     rules.push({ kind: 'emoji-per-line', hard: false, label: '每行 1 个 emoji' });
   }
+  if (/全篇\s*不重复|图标[^。\n]*不重复|不重复[^。\n]*图标/.test(t)) {
+    rules.push({ kind: 'unique-icon', hard: false, label: '图标全篇不重复' });
+  }
   return rules;
 }
 
 /** 去空白字数：用户数的是可见字，空格与换行不计。 */
 const aiCharCount = (s) => [...String(s || '').replace(/\s+/g, '')].length;
+
+/* 行首图标：含 VS16 / ZWJ 组合。「全篇不重复」以前只是提示词里一句话，
+ * 模型照样三行都用 ❄️；缓存只能保证不摇，不能保证第一次就对。 */
+const AI_ICON_RE = /\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*/u;
+const AI_ICON_ANY = new RegExp(AI_ICON_RE.source, 'gu');
+const AI_ICON_HEAD = new RegExp(`^(\\s*)(${AI_ICON_RE.source})(\\s*)([\\s\\S]*)$`, 'u');
+const AI_ICON_FALLBACK = ['❄️', '⛅', '⚠️', '☀️', '☁️', '🌧️', '🧣', '💡', '📌', '🔔'];
+const aiIconKey = (s) => String(s || '').replace(/\uFE0F/g, '');
+
+/** 图标池优先取任务里的行模板（今晚 ❄️ / 明天 ⛅ / 建议 🧣），再补提示词与通用兜底。 */
+function aiIconPool(text) {
+  const s = String(text || '');
+  const row = [...s.matchAll(new RegExp(`行[:：]\\s*(${AI_ICON_RE.source})`, 'gu'))]
+    .map((m) => m[1]);
+  return [...new Set([...row, ...[...s.matchAll(AI_ICON_ANY)].map((m) => m[0]), ...AI_ICON_FALLBACK])];
+}
+
+/** 重复图标按池顺序替换成未用过的那个；不重排内容、不改图标数量。 */
+function dedupeIcons(text, pool) {
+  const seen = new Set();
+  const alt = Array.isArray(pool) ? pool : [];
+  return String(text || '').split('\n').map((l) => {
+    const m = l.match(AI_ICON_HEAD);
+    if (!m) return l;
+    let icon = m[2];
+    if (seen.has(aiIconKey(icon))) {
+      const next = alt.find((c) => c && !seen.has(aiIconKey(c)));
+      if (next) icon = next;
+    }
+    seen.add(aiIconKey(icon));
+    return m[1] + icon + m[3] + m[4];
+  }).join('\n');
+}
 
 /** 逐条检查生成结果，返回 { msg, hard } —— 只有 hard 项才值得再花一次调用去纠正。 */
 function aiReview(body, rules, factText) {
@@ -2704,6 +2740,15 @@ function aiReview(body, rules, factText) {
       const isEmoji = (ch) => /\p{Extended_Pictographic}/u.test(ch);
       const i = lines.findIndex((l) => [...l].filter(isEmoji).length !== 1);
       if (i >= 0) add(`第 ${i + 1} 行不是正好 1 个 emoji`, r.hard);
+    } else if (r.kind === 'unique-icon') {
+      const seen = new Set();
+      for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(AI_ICON_HEAD);
+        if (!m) continue;
+        const k = aiIconKey(m[2]);
+        if (seen.has(k)) { add(`第 ${i + 1} 行图标 ${m[2]} 与前面重复`, r.hard); break; }
+        seen.add(k);
+      }
     }
   }
   return out;
@@ -2793,6 +2838,9 @@ async function aiPolish(cfg, opts) {
   // -1.4°C 两版 —— 按任务要求做一次确定性归一，不指望模型每次自觉。
   const taskNeed = String(taskInstruction || '');
   const tightUnits = /紧贴/.test(taskNeed) && /°C/.test(taskNeed);
+  // 只在任务明确要求「全篇不重复」时归一：别的任务可能故意三行都挂 ✅ 当清单。
+  const needUniqueIcons = plan.rules.some((r) => r.kind === 'unique-icon');
+  const iconPool = needUniqueIcons ? aiIconPool(taskNeed) : [];
   const messages = [
     { role: 'system', content: plan.system },
     { role: 'user', content: plan.user },
@@ -2820,6 +2868,7 @@ async function aiPolish(cfg, opts) {
     // 正常输出远短于此，异常跑飞时才裁，且裁了会明确标注。
     let bodyText = String(parsed.body || '').replace(/\\n/g, '\n');
     if (tightUnits) bodyText = bodyText.replace(/(\d)\s+(°C)/g, '$1$2');
+    if (needUniqueIcons) bodyText = dedupeIcons(bodyText, iconPool);
     return { title: String(parsed.title).slice(0, 40), body: clipBody(bodyText) };
   };
 
@@ -5285,7 +5334,10 @@ async function runTask(task, trigger) {
         // 留一份 AI 之前的原文：通知详情里能直接切换比对「到底改了什么」，
         // 这是用户判断「AI 有没有用」唯一靠得住的依据。以前只留 800 字，
         // 多步骤任务的原文后半段直接消失；现在完整保留，只受统一安全阀约束。
-        notice.rawBody = clipBody(notice.body || '');
+        // 光留「实况：HTTP 200…」这类状态串，点开也核不了 AI 抄的温度对不对。
+        // 把 AI 实际看到的同一份接口材料附上，用户能逐条对事实结论与 24 行 hourly。
+        notice.rawBody = clipBody(String(notice.body || '')
+          + (rawData ? '\n\n【AI 依据的接口数据】\n' + String(rawData) : ''));
         notice.body = polished.body;
         /*
          * 标注要能核对：以前只写「按任务要求」，但模型可能压根没照做，用户看到的

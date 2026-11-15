@@ -1096,7 +1096,7 @@ function renderInbox() {
         <div class="inbox-text">${esc(n.body || '')}</div>
         ${n.aiNote ? `<div class="inbox-ai">${esc(n.aiNote)}</div>` : ''}
         ${n.rawBody ? `
-        <button type="button" class="inbox-raw-toggle" data-raw="${esc(n.id)}">看 AI 前的原文</button>
+        <button type="button" class="inbox-raw-toggle" data-raw="${esc(n.id)}">原文与依据</button>
         <div class="inbox-text inbox-raw" hidden></div>` : ''}
         <div class="inbox-time">${esc(fmtDateTime(n.at))} · ${esc(relTime(n.at))}${n.trigger && trigMap[n.trigger] ? ' · ' + trigMap[n.trigger] : ''}</div>
       </div>
@@ -5001,8 +5001,8 @@ function bind() {
 
   $('#inbox').addEventListener('click', async (e) => {
     /*
-     * 「看 AI 前的原文」：直接把改写前的那段展开在下面，不弹层、不跳转。
-     * 用户判断「这次优化有没有用」只能靠对比，光看一条优化后的正文是看不出来的。
+     * 「原文与依据」：把 AI 之前的正文和它实际读到的接口材料一起展开在下面。
+     * 用户判断播报有没有抄错数，只能靠逐条对照。
      */
     const rw = e.target.closest('[data-raw]');
     if (rw) {
@@ -5012,7 +5012,7 @@ function bind() {
       if (n && box) {
         box.hidden = !box.hidden;
         box.textContent = n.rawBody || '';
-        rw.textContent = box.hidden ? '看 AI 前的原文' : '收起原文';
+        rw.textContent = box.hidden ? '原文与依据' : '收起';
       }
       return;
     }
