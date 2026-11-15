@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-24';
+const SMS_BUILD = 'audit-batch-25';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -6560,11 +6560,22 @@ function sanitizeNmPush(raw) {
 
 function sanitizeTask(input, existing) {
   const base = existing || { id: uid('task'), runCount: 0, failCount: 0, lastRun: null, lastResult: null, createdAt: nowISO() };
-  const type = input.type === 'remind' ? 'remind' : 'http';
-  // 节奏：支持一个任务配多个（09:00、12:00 各来一次）；老前端只传 schedule 也能用
-  const rawSchedules = Array.isArray(input.schedules) && input.schedules.length
+  // 没传 type 时沿用原类型：默认成 http 会把「提醒任务」一改就改没了
+  const type = (input.type || (existing && existing.type)) === 'remind' ? 'remind' : 'http';
+  /*
+   * 节奏：支持一个任务配多个（09:00、12:00 各来一次）；老前端只传 schedule 也能用
+   *
+   * 部分更新：upsert 常只传要改的字段（比如只调通知策略），这时 schedule 必须回落
+   * 到库里的值。以前没传就塞 `[{}]` → normalizeSchedule({}) 给出默认的「每天 9 点」，
+   * 于是一次「改配置」的调用会把 20 分钟间隔悄悄换成一天跑一次，而且不报错。
+   */
+  const provided = Array.isArray(input.schedules) && input.schedules.length
     ? input.schedules
-    : [input.schedule || {}];
+    : (input.schedule ? [input.schedule] : null);
+  const rawSchedules = provided
+    || (existing && Array.isArray(existing.schedules) && existing.schedules.length
+      ? existing.schedules
+      : (existing && existing.schedule ? [existing.schedule] : [{}]));
   const seen = new Set();
   const schedules = [];
   for (const raw of rawSchedules) {
@@ -6588,17 +6599,29 @@ function sanitizeTask(input, existing) {
   if (!schedules.length) schedules.push(normalizeSchedule({}));
   const schedule = schedules[0]; // 老字段保留第一套，兼容旧读法
 
-  const config = type === 'http'
-    ? sanitizeHttpConfig(input.config)
-    : {
-        message: String((input.config && input.config.message) || ''),
-        // 提醒类任务的推送通道：站内永远在，其余按用户勾的来
-        channels: withInapp(
-          Array.isArray(input.config && input.config.channels)
-            ? sanitizeChannelList(input.config.channels)
-            : ['inapp'],
-        ),
-      };
+  /*
+   * 请求配置同样支持部分更新：只改通知策略时 config 可能整个不传，
+   * 以前会走 sanitizeHttpConfig(undefined) → 丢掉 url → 直接抛「必须填写请求地址」，
+   * 或者在有 steps 的任务上把多步骤结构清掉。
+   */
+  let config;
+  if (type === 'http') {
+    config = (input.config === undefined && existing && existing.type === 'http' && existing.config)
+      ? { ...existing.config }
+      : sanitizeHttpConfig(input.config);
+  } else {
+    config = (input.config === undefined && existing && existing.type === 'remind' && existing.config)
+      ? { ...existing.config }
+      : {
+          message: String((input.config && input.config.message) || ''),
+          // 提醒类任务的推送通道：站内永远在，其余按用户勾的来
+          channels: withInapp(
+            Array.isArray(input.config && input.config.channels)
+              ? sanitizeChannelList(input.config.channels)
+              : ['inapp'],
+          ),
+        };
+  }
 
   // 任务级通知策略：只有前端明确传了才落库，缺省表示跟随全局（老任务行为不变）
   const notify = sanitizeNotifyPolicy(input.config && input.config.notify);
@@ -6631,7 +6654,10 @@ function sanitizeTask(input, existing) {
     name: String(input.name || '').trim() || (existing && existing.name) || '未命名任务',
     group,
     type,
-    enabled: input.enabled !== false,
+    // 启停同样按部分更新处理：没传就保持原状，否则「只改通知」会把暂停的任务偷偷打开
+    enabled: input.enabled === undefined
+      ? (existing ? existing.enabled !== false : true)
+      : input.enabled !== false,
     schedule,
     schedules,
     config,

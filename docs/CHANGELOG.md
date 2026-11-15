@@ -6,6 +6,52 @@
 
 ---
 
+## 2026-11-15 · 第二十五批（已上线）· upsert 部分更新语义 + 保活 v4 降级 + 保活可观测 · `audit-batch-25`
+
+**起因**：给 `instabox` 关掉重复告警时只传了 `name + config.notify`，
+结果它的调度从「每 20 分钟」被静默换成默认的「每天 9 点」。顺着查到两个真问题。
+
+**1. `/api/tasks/upsert` 说是部分更新，实现是全量替换**
+- `sanitizeTask` 里没传 `schedule` 就塞 `[{}]` → `normalizeSchedule({})` 给默认值，
+  `existing` 参数在这一处完全没用上。同样不回落 existing 的还有
+  `enabled`（暂停中的任务会被偷偷打开）、`type`（提醒任务会被改成 http）、
+  `config`（只改通知策略就会丢 url，或直接抛「必须填写请求地址」）
+- 四处都改成「没传就沿用库里的值」，显式传值仍然照改
+- 新增 `tests/task-patch.test.cjs`（17 项）：只改通知 / 只改组名 / 只传 name /
+  显式传 schedule 四条路径，覆盖 schedule、schedules、enabled、type、config、nextRun
+
+**2. 保活 Worker → v4（`instabox-keepalive`）**
+- **核心**：v3 在 `if (st.status !== 200) return` 处直接退出，管理 API 一挂，
+  连唯一不依赖 API 的端口探活都不做了 —— 控制面故障把数据面一起带走。
+  现在改为降级到 `ping-only`，端口探活永远执行
+- 鉴权（401/403）、网络（status 0）、其他 HTTP 码分开归类，
+  `/health` 直接给 `alert` 名，外部轮询不用解析 body
+- 端口失败按 `kind` 分四类（`up` / `unpublished` / `tunnel-down` / `timeout`）：
+  404 是「端口映射被撤 = 机器已停」，和 5xx 隧道抖动不是一回事
+- `/health` 自己探一次端口，返回三档 HTTP 码：`ok` 200 / `degraded` 207 / `down` 503
+- 看板把「看不见」和「已暂停」分开画：控制面读不到时显示「只读模式 · 端口通」，
+  不冒充「已暂停」—— 前者要换 key，后者还能自动叫醒，处置完全不同
+
+**3. 补上外部监控（这次事故没人知道，就是因为缺这一环）**
+- 新增 CronHub 任务 `instabox 保活自检`，每 15 分钟打 `ibx-probe.pages.dev/health`，
+  `expectStatus: 200`，非 `ok` 三档全判失败，走站内 + webhook 告警
+- 原 `instabox` 任务（每 20 分钟直接打 8000 端口）保留作端到端验证与历史留痕，
+  但 `onFailure` 关掉 —— 两个会同时失败，双份告警只是噪音
+
+**验证**
+- `npm test` 13 个文件全通（新增 task-patch 17 项）
+- 保活本地 `sim4.cjs` 41 条分支全过（降级 / 端口分类 / 三档码 / 贴顶换轮 / 冷却 / 令牌 / 看板）
+- 线上 `build=audit-batch-25`；只传 `schedule` 的 upsert 验证通过：
+  url / notify / runCount 全部保留，`nextRun` 正确按 20 分钟重算
+- 告警链路实测：手动触发自检任务 → 判 503 失败 →
+  通知正文 `❌ instabox 保活自检 | 状态码 503，期望 200。端口未发布，状态 down，版本 keepalive-v4`
+
+**遗留**：机器已被 InstaBox 暂停（四端口 404），管理 API key 被吊销且新 key 未提供，
+automatic 恢复依赖人工在 dashboard 重建 key 后写回 Worker secret。key 一恢复，
+下个 tick 会自己 `resume` 唤醒，不需要额外操作。
+
+---
+
 ## 2026-11-15 · 第二十四批（已上线）· relay-v5 收口 + 保活 v3 · `audit-batch-24`
 
 **需求**：审阅短信中继与两个定时任务（`instabox-keepalive` `*/5`、`sms-relay` 陪护 `*/30`），
