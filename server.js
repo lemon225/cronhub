@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-34';
+const SMS_BUILD = 'audit-batch-35';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -1721,7 +1721,7 @@ const CH_LABEL = { sms: '短信', webhook: 'Webhook', email: '邮件', ai: 'AI' 
  * 才知道这条消息是从哪条路走的，看到「Webhook」等于什么都没说。
  */
 const WH_SCHEME = {
-  notifyme: 'NotifyMe（手机推送）',
+  notifyme: 'NotifyMe',
   generic: '通用 JSON',
   serverchan: 'Server酱',
   feishu: '飞书机器人',
@@ -5241,16 +5241,16 @@ async function runTask(task, trigger) {
             pushSysLog({
               level: r.ok ? 'info' : 'warn',
               source: 'channel',
-              msg: `渠道 NotifyMe 手机推送 ${r.ok ? '已提交' : '未成功'}：${String(r.message || '').slice(0, 200)}`,
+              msg: `渠道 NotifyMe ${r.ok ? '已提交' : '未成功'}：${String(r.message || '').slice(0, 200)}`,
               detail: { channel: 'NotifyMe', task: task.name, ok: !!r.ok, message: String(r.message || '').slice(0, 400) },
             });
           } catch (e) {
             ok = false;
-            results.push('手机推送失败：' + e.message);
+            results.push('NotifyMe 失败：' + e.message);
             pushSysLog({
               level: 'error',
               source: 'channel',
-              msg: '渠道 NotifyMe 手机推送失败：' + String(e.message || '').slice(0, 200),
+              msg: '渠道 NotifyMe 失败：' + String(e.message || '').slice(0, 200),
               detail: { channel: 'NotifyMe', task: task.name, error: String(e.message || '').slice(0, 400) },
             });
           }
@@ -5599,7 +5599,7 @@ async function runTask(task, trigger) {
       return { ...(last || {}), attempts: MAX, exhausted: true };
     };
     const labelOf = (ch) => {
-      if (ch === 'notifyme') return 'NotifyMe（手机推送）';
+      if (ch === 'notifyme') return 'NotifyMe';
       const rc = resolveChannel(ch);
       return rc ? rc.label : ch;
     };

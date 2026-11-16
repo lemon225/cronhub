@@ -1102,7 +1102,7 @@ function renderInbox() {
       </div>
       ${n.channels && n.channels.length ? `
       <div class="inbox-channels" title="各渠道推送结果">
-        ${n.channels.map((c) => `<span class="ch-chip ${c.ok ? 'is-ok' : 'is-err'}" title="${esc(c.message || '')}">${c.ok ? '✓' : '✕'} ${esc(c.name)}</span>`).join('')}
+        ${n.channels.map((c) => `<span class="ch-chip ${c.ok ? 'is-ok' : 'is-err'}" title="${esc(c.message || '')}">${c.ok ? '✓' : '✕'} ${esc(normChannelName(c.name))}</span>`).join('')}
       </div>` : ''}
       ${n.deadLetterId ? `
       <div class="inbox-acts">
@@ -1415,10 +1415,10 @@ const CH_ACTIVE = { sms: 'main', webhook: 'main', email: 'main', ai: 'main' };
  * Webhook 只是「方案容器」，真正发到哪由 format 决定。
  * 设置页那张卡还叫 Webhook（那里确实在填地址和凭据），但**任务渠道、通知记录、
  * 系统日志一律显示方案名** —— 用户勾了「Webhook」根本不知道自己会收到什么，
- * 勾了「NotifyMe（手机推送）」才知道是手机。
+ * 勾了「NotifyMe」才知道是手机。
  */
 const WH_SCHEMES = {
-  notifyme: { short: 'NotifyMe', full: 'NotifyMe（手机推送）' },
+  notifyme: { short: 'NotifyMe', full: 'NotifyMe' },
   generic: { short: '通用 JSON', full: '通用 JSON' },
   serverchan: { short: 'Server酱', full: 'Server酱' },
   feishu: { short: '飞书机器人', full: '飞书机器人' },
@@ -1428,6 +1428,13 @@ const WH_SCHEMES = {
 function whSchemeName(format, short) {
   const s = WH_SCHEMES[String(format || 'generic')] || WH_SCHEMES.generic;
   return short ? s.short : s.full;
+}
+/*
+ * 历史通知记录里存的是当时的渠道名（「NotifyMe（手机推送）·fcm」「手机推送」），
+ * 现在对外统一叫 NotifyMe。只在渲染时归一，不改存档数据。
+ */
+function normChannelName(name) {
+  return String(name || '').replace('NotifyMe（手机推送）', 'NotifyMe').replace('手机推送', 'NotifyMe');
 }
 /** 某个渠道配置是不是走 NotifyMe（决定要不要露「NotifyMe 推送选项」）。 */
 function isNmFormat(cfg) { return String((cfg && cfg.format) || '') === 'notifyme'; }
@@ -1950,7 +1957,7 @@ function renderTaskChannelChips(remindChans, notifyChans) {
   const nmGroup = [];
   const smsGroup = [];
   const restGroup = [];
-  if (notifymeUsable() && !whCoversNotifyme) nmGroup.push({ v: 'notifyme', t: 'NotifyMe（手机推送）' });
+  if (notifymeUsable() && !whCoversNotifyme) nmGroup.push({ v: 'notifyme', t: 'NotifyMe' });
 
   for (const type of ['webhook', 'email']) {
     if (channelUsable(type)) {
@@ -2002,7 +2009,7 @@ function renderTaskChannelChips(remindChans, notifyChans) {
     known.add(v);
     const type = String(v).split(':')[0];
     const label = v === 'notifyme'
-      ? 'NotifyMe（手机推送·旧配置）'
+      ? 'NotifyMe（旧配置）'
       : (CH_META[type] ? `${CH_META[type].title}（历史账号）` : v);
     parts.push({ v, t: label });
   }
