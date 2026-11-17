@@ -23,7 +23,7 @@ const dns = require('node:dns');
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-37';
+const SMS_BUILD = 'audit-batch-38';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -4587,6 +4587,9 @@ async function runHttpSteps(task) {
         const e = new Error(parts.join(' ｜ '));
         if (failBody) e.responseBody = failBody;
         if (failStatus != null) e.httpStatus = failStatus;
+        // 带上已经跑完的步骤：配置测试要在失败时也能逐条显示「哪一步过了、哪一步挂了」。
+        // 正常执行路径不读这个字段，纯粹是给测试接口多开一扇门，不改变任何既有行为。
+        e.steps = collected;
         throw e;
       }
     }
@@ -7156,6 +7159,83 @@ async function handleApi(req, res, url) {
   if (pathname === '/api/state' && method === 'GET') {
     const s = sessionOf(req);
     return sendJSON(res, 200, publicState(s && s.role === 'admin' ? 'admin' : 'user'));
+  }
+
+  /*
+   * 配置测试（编辑面板「测试」按钮）：用当前表单里**尚未保存**的配置真跑一次，
+   * 让用户在保存前就知道地址/请求头/步骤对不对。
+   *
+   * 和 /api/tasks/:id/run 的本质区别 —— 这条路径没有任何副作用：
+   *   · 不 push 进 state.tasks、不落盘；
+   *   · 不写执行日志、不动 runCount/failCount/lastRun/fail 告警；
+   *   · 不走 buildRunNotice / AI 改写 / 站内与各外部渠道推送。
+   * 只调 runHttpSteps（纯发请求 + 收集每步结果），把结果回给前端展示。
+   * 「测试」若也发通知，用户点一次就被自己的配置轰炸一次，那就本末倒置了。
+   */
+  if (pathname === '/api/tasks/test' && method === 'POST') {
+    const body = await readBody(req);
+    const type = body.type === 'remind' ? 'remind' : 'http';
+    const name = String((body && body.name) || '').trim() || '未命名';
+    const rawCfg = (body && body.config) || {};
+    /*
+     * 故意不复用 sanitizeTask：它要求合法的任务名和 schedule，而这两项跟
+     * 「请求能否跑通」无关 —— 名字/cron 还没填时也该能测地址。
+     * 只按保存时的同一套规则归一 config（步骤继承、超时/重试上限），
+     * 保证「测试通过」和「保存后跑挂」不会是两份行为。
+     */
+    const config = type === 'http' ? sanitizeHttpConfig(rawCfg) : {
+      message: String(rawCfg.message || ''),
+      channels: withInapp(sanitizeChannelList(
+        Array.isArray(rawCfg.channels) && rawCfg.channels.length ? rawCfg.channels : ['inapp'])),
+    };
+    const task = { id: 'test', name, type, config };
+    const startedAt = Date.now();
+    if (type !== 'http') {
+      return sendJSON(res, 200, {
+        ok: true, type: 'remind', steps: [],
+        message: '提醒任务无需请求测试，配置检查通过', duration: Date.now() - startedAt,
+      });
+    }
+    // 用到 {{ACCESS_TOKEN}} 时先续凭据：否则 applyTokenPlaceholder 拿不到值，
+    // 测试会误报「占位符未替换」。续期只写凭据缓存，不碰任务状态。
+    try {
+      if (usesTokenPlaceholder(task)) await currentAccessToken();
+    } catch (e) {
+      return sendJSON(res, 200, {
+        ok: false, type: 'http', steps: [],
+        error: `凭据续期失败：${String((e && e.message) || e).slice(0, 200)}`, duration: Date.now() - startedAt,
+      });
+    }
+    try {
+      const guarded = await Promise.race([
+        runHttpSteps(task).then((rr) => ({ rr })),
+        new Promise((_, rej) => {
+          const t = setTimeout(() => rej(new Error('测试超过 60 秒，已中止')), 60000);
+          if (t.unref) t.unref();
+        }),
+      ]);
+      const steps = (guarded.rr.steps || []).map((s) => ({
+        name: s.name,
+        ok: s.ok !== false,
+        status: s.status == null ? null : s.status,
+        message: cleanRunMessage(s.message || s.error || ''),
+      }));
+      return sendJSON(res, 200, {
+        ok: true, type: 'http', steps,
+        message: cleanRunMessage(guarded.rr.message), duration: Date.now() - startedAt,
+      });
+    } catch (e) {
+      const steps = Array.isArray(e && e.steps) ? e.steps.map((s) => ({
+        name: s.name,
+        ok: s.ok !== false,
+        status: s.status == null ? null : s.status,
+        message: cleanRunMessage(s.message || s.error || ''),
+      })) : [];
+      return sendJSON(res, 200, {
+        ok: false, type: 'http', steps,
+        error: cleanRunMessage((e && e.message) || '测试失败'), duration: Date.now() - startedAt,
+      });
+    }
   }
 
   if (pathname === '/api/tasks' && method === 'POST') {

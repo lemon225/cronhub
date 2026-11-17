@@ -1560,6 +1560,47 @@ select { cursor: pointer; appearance: none;
   border-top: 1px dashed var(--line);
 }
 
+/* 编辑面板「测试」按钮的结果：贴在保存行下方，逐条列步骤 */
+.test-result {
+  margin: 0 0 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.test-result[hidden] { display: none; }
+.tr-head { font-weight: 500; margin-bottom: 6px; }
+.tr-head.is-ok { color: var(--ok); }
+.tr-head.is-err { color: var(--err); }
+.tr-fail {
+  margin-bottom: 6px; padding: 5px 8px;
+  background: var(--err-bg); color: var(--err);
+  border-radius: 6px; word-break: break-all;
+}
+.tr-step {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 3px 0;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-700);
+}
+.tr-step:first-of-type { border-top: 0; }
+.tr-mark { flex: none; font-weight: 500; }
+.tr-step.is-ok .tr-mark { color: var(--ok); }
+.tr-step.is-err .tr-mark { color: var(--err); }
+.tr-step b { flex: none; }
+.tr-status { flex: none; color: var(--ink-500); font-family: var(--font-mono); }
+.tr-msg { color: var(--ink-500); word-break: break-all; }
+/* 文字按钮测试中：::before 转圈，避免依赖 svg */
+#modalTest.is-spin { position: relative; padding-left: 26px; pointer-events: none; opacity: .7; }
+#modalTest.is-spin::before {
+  content: ''; position: absolute; left: 10px; top: 50%;
+  width: 11px; height: 11px; margin-top: -6px;
+  border: 2px solid var(--line); border-top-color: var(--brand);
+  border-radius: 50%; animation: spin .8s linear infinite;
+}
+
 /* ============================================================
    Toast
    ============================================================ */

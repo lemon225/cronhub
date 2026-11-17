@@ -3005,6 +3005,8 @@ function openModal(task) {
   S.editingId = task ? task.id : null;
   $('#modalTitle').textContent = task ? '编辑任务' : '新建任务';
   $('#modalErr').textContent = '';
+  const testOut = $('#testResult');
+  if (testOut) { testOut.hidden = true; testOut.textContent = ''; }
 
   const t = task || { name: '', type: 'http', enabled: true, schedule: { mode: 'cron', cron: '0 9 * * *', everyMinutes: 60 }, config: {} };
   $('#fName').value = t.name || '';
@@ -3603,12 +3605,20 @@ function readSteps() {
   return out;
 }
 
-async function saveTask() {
-  const errBox = $('#modalErr');
-  errBox.textContent = '';
-
+/*
+ * 收集编辑面板的当前配置 + 分级校验，保存与测试共用这一份来源。
+ * 返回 { payload, hard, soft }：
+ *   hard —— 缺了就没法测/存的（致命），两类操作都拦；
+ *   soft —— 建议补齐但不影响这次请求能否跑通（普通提示），保存仍照原样拦，
+ *           测试只 toast 提示、不拦截。
+ * 之所以分开，是因为「名字没填」「cron 没写」跟「这个 URL 能不能请求通」无关：
+ * 测试的价值就在验证后者，不该被前者挡住。
+ */
+function collectForm() {
+  const hard = [];
+  const soft = [];
   const name = $('#fName').value.trim();
-  if (!name) { errBox.textContent = '请填写任务名称'; return; }
+  if (!name) soft.push('请填写任务名称');
 
   readSchedRows();
   const schedules = (S.schedRows || []).map((r) => (r.mode === 'interval'
@@ -3621,8 +3631,7 @@ async function saveTask() {
       }
     : { mode: 'cron', cron: String(r.cron || '').trim() }));
   if (schedules.some((sc) => sc.mode === 'cron' && !sc.cron)) {
-    errBox.textContent = '有一条节奏没填 cron 表达式';
-    return;
+    soft.push('有一条节奏没填 cron 表达式');
   }
 
   let config;
@@ -3630,17 +3639,16 @@ async function saveTask() {
     const steps = readSteps();
     const url = $('#fUrl').value.trim();
     // 多步骤任务的主地址可以留空（由第一步兜底），单请求任务必须填
-    if (!url && !steps.length) { errBox.textContent = '请填写请求地址，或至少添加一个步骤'; return; }
-    if (url && !/^https?:\/\//i.test(url)) { errBox.textContent = '请求地址需要以 http:// 或 https:// 开头'; return; }
+    if (!url && !steps.length) { hard.push('请填写请求地址，或至少添加一个步骤'); }
+    if (url && !/^https?:\/\//i.test(url)) { hard.push('请求地址需要以 http:// 或 https:// 开头'); }
     for (const s of steps) {
       if (s.url && !/^https?:\/\//i.test(s.url)) {
-        errBox.textContent = `步骤「${s.name || s.url}」的地址需要以 http:// 或 https:// 开头`;
-        return;
+        hard.push(`步骤「${s.name || s.url}」的地址需要以 http:// 或 https:// 开头`);
       }
     }
     const headers = $('#fHeaders').value.trim();
     if (headers) {
-      try { JSON.parse(headers); } catch { errBox.textContent = '请求头不是合法 JSON'; return; }
+      try { JSON.parse(headers); } catch { hard.push('请求头不是合法 JSON'); }
     }
     const alsoRaw = $('#fAlsoOk').value.trim();
     const also = alsoRaw ? alsoRaw.split(/[\s,;]+/).map(Number).filter((n) => Number.isInteger(n)) : [];
@@ -3660,7 +3668,7 @@ async function saveTask() {
     if (steps.length) config.steps = steps;
   } else {
     const message = $('#fMessage').value.trim();
-    if (!message) { errBox.textContent = '请填写提醒内容'; return; }
+    if (!message) { hard.push('请填写提醒内容'); }
     const channels = $$('#fChannels input:checked').map((i) => i.value);
     // 站内是必选项（复选框 disabled 但仍会提交），这里再保一次底
     if (!channels.includes('inapp')) channels.unshift('inapp');
@@ -3674,12 +3682,10 @@ async function saveTask() {
   const nChannels = $$('#fNotifyChannels input:checked').map((i) => i.value);
   if (!nChannels.includes('inapp')) nChannels.unshift('inapp');
   if (notifyOn && !nSuccess && !nFailure) {
-    errBox.textContent = '开了任务完成通知，至少要选一个通知时机';
-    return;
+    soft.push('开了任务完成通知，至少要选一个通知时机');
   }
   if (notifyOn && !nChannels.length) {
-    errBox.textContent = '开了任务完成通知，至少要选一个通知渠道';
-    return;
+    soft.push('开了任务完成通知，至少要选一个通知渠道');
   }
   config.notify = { enabled: notifyOn, onSuccess: nSuccess, onFailure: nFailure, channels: nChannels };
   /*
@@ -3723,6 +3729,16 @@ async function saveTask() {
     enabled: $('#fEnabled').checked,
     schedule: schedules[0], schedules, config,
   };
+  return { payload, hard, soft };
+}
+
+async function saveTask() {
+  const errBox = $('#modalErr');
+  errBox.textContent = '';
+  const { payload, hard, soft } = collectForm();
+  // 保存沿用原来的严格校验：硬错误和普通提示都拦（和改动前一致）
+  const block = hard[0] || soft[0];
+  if (block) { errBox.textContent = block; return; }
 
   const btn = $('#modalSave');
   btn.disabled = true;
@@ -3741,6 +3757,56 @@ async function saveTask() {
     errBox.textContent = err.message;
   } finally {
     btn.disabled = false;
+  }
+}
+
+/*
+ * 「测试」按钮：用当前表单尚未保存的配置真跑一次，只验证请求能不能通。
+ * 分级原则：hard（缺数据/配置错误）才拦；soft（名字、cron、通知时机这类
+ * 与请求无关的）只 toast 提醒，照样测。测试不发通知、不落日志、不改统计。
+ */
+async function testTask() {
+  const errBox = $('#modalErr');
+  errBox.textContent = '';
+  const out = $('#testResult');
+  out.hidden = true;
+  out.textContent = '';
+  const { payload, hard, soft } = collectForm();
+
+  // 普通提示：告知但不拦
+  soft.forEach((m) => toast(m, 'warn'));
+  if (hard.length) {
+    errBox.textContent = hard[0];
+    toast(hard[0], 'err');
+    return;
+  }
+
+  const btn = $('#modalTest');
+  btn.disabled = true;
+  btn.classList.add('is-spin');
+  try {
+    const r = await api('/api/tasks/test', { method: 'POST', body: payload, timeout: 70000 });
+    if (r.type === 'remind') {
+      out.innerHTML = `<div class="tr-head is-ok">✓ ${esc(r.message)}</div>`;
+      out.hidden = false;
+      return;
+    }
+    const steps = Array.isArray(r.steps) ? r.steps : [];
+    const head = r.ok
+      ? `✓ 测试通过 · ${steps.length} 步 · ${r.duration}ms`
+      : `✕ 测试失败 · ${r.duration}ms`;
+    const rows = steps.map((s) => (
+      `<div class="tr-step ${s.ok ? 'is-ok' : 'is-err'}"><span class="tr-mark">${s.ok ? '✓' : '✕'}</span><b>${esc(s.name || '步骤')}</b>${s.status == null ? '' : ` <span class="tr-status">${s.status}</span>`}<span class="tr-msg">${esc(s.message)}</span></div>`
+    )).join('');
+    const fail = r.ok ? '' : `<div class="tr-fail">${esc(r.error || '')}</div>`;
+    out.innerHTML = `<div class="tr-head ${r.ok ? 'is-ok' : 'is-err'}">${head}</div>${fail}${rows}`;
+    out.hidden = false;
+  } catch (err) {
+    errBox.textContent = err.message;
+    toast(err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('is-spin');
   }
 }
 
@@ -6271,6 +6337,7 @@ function bind() {
   if ($('#fNotifyPrompt')) $('#fNotifyPrompt').addEventListener('input', syncAiPromptCount);
   if ($('#fAiPreviewBtn')) $('#fAiPreviewBtn').addEventListener('click', showAiPreview);
   $('#modalSave').addEventListener('click', saveTask);
+  $('#modalTest').addEventListener('click', testTask);
 }
 
 /* ------------------------------------------------------------ 启动 */
