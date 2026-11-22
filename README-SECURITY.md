@@ -327,7 +327,7 @@ ACTIVE ──┬─→ EXPIRING ──┬─→ NEED_REAUTH ──→ REVOKED
 
 ### 设备指纹脱敏（官方 4.6）
 
-`device_info.js` 不再把服务器 hostname / CPU 型号当成用户设备上报（那是「LAPTOP-CHEN」级别的真实机器名）。
+`device_info.js` 不再把服务器 hostname / CPU 型号当成用户设备上报（那是「LAPTOP-XXXX」级别的真实机器名）。
 默认上报固定占位值 `CRONHUB-SRV` / `VIRTUAL-CPU`（风控看重前后一致，不是真实性）；
 `CRONHUB_SMS_ANON_DEVICE=0` 可关。
 

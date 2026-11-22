@@ -146,7 +146,7 @@ registerFunc('quarter', (value, args, ctx) => {
 - 只走 `*.pages.dev`；`*.workers.dev` 已被定向阻断。部署用根目录 `_worker.js` advanced mode + Wrangler 3.28。
 - `SCRIPT_SECRET` / `SCRIPT_KEYS` 只能在 Cloudflare 控制台设（现有令牌 `PUT .../settings` 返 405），不写进源码、不写进 `D:\Temp`。
 - 禁止 `eval` / `new Function` 执行外部传入的代码；脚本必须是源码里的白名单项。把脚本正文放 KV 动态加载属于远程代码执行通道，需单独授权。
-- 不回打 `/api/wake`（tick 回环）；回打站点必须带 `?sharecode=ZDRK2MO6CP`。
+- 不回打 `/api/wake`（tick 回环）；回打站点必须带 `?sharecode=<sharecode>`。
 - 响应里不回显完整密钥；`vars-echo` 对含 SECRET/TOKEN/KEY/PASS/CRED 的键自动打码。
 - 调度源只有 CronHub：不在 CF 给同一脚本再挂 Cron，否则双跑。脚本要幂等。
 
@@ -155,7 +155,7 @@ registerFunc('quarter', (value, args, ctx) => {
 ```bash
 mkdir -p pages-adv
 cp cloudfn/_worker.js cloudfn/index.html pages-adv/
-CLOUDFLARE_API_TOKEN=<Pages:Edit> CLOUDFLARE_ACCOUNT_ID=7c502eedc21c540887e31422d55009ea \
+CLOUDFLARE_API_TOKEN=<Pages:Edit> CLOUDFLARE_ACCOUNT_ID=<CF_ACCOUNT_ID> \
   node <wrangler3.28>/bin/wrangler.js pages deploy pages-adv --project-name cronhub-scripts
 curl -s https://cronhub-scripts.pages.dev/__health
 ```

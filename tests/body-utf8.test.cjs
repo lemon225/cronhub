@@ -50,7 +50,7 @@ const splitEvery = (buf, n) => {
 
 (async () => {
   console.log('\n[1] 多字节字符跨块不被截断');
-  const payload = JSON.stringify({ name: '天气预报·三甲集', note: '字段时，只输出以下 3 行' });
+  const payload = JSON.stringify({ name: '天气预报·示例镇', note: '字段时，只输出以下 3 行' });
   const buf = Buffer.from(payload, 'utf8');
   // 逐字节切：每个 3 字节汉字都必然跨块，最坏情况
   const byteByByte = await readBody(fakeReq(splitEvery(buf, 1)));
@@ -58,7 +58,7 @@ const splitEvery = (buf, n) => {
   ok('中文没有出现替换符', !JSON.stringify(byteByByte).includes('\uFFFD'));
 
   console.log('\n[2] 常规分块与空体');
-  const big = JSON.stringify({ items: Array.from({ length: 300 }, (_, i) => ({ name: `任务${i}·三甲集` })) });
+  const big = JSON.stringify({ items: Array.from({ length: 300 }, (_, i) => ({ name: `任务${i}·示例镇` })) });
   const chunked = await readBody(fakeReq(splitEvery(Buffer.from(big, 'utf8'), 7)));
   ok('7 字节分块的大 body 完整还原', JSON.stringify(chunked) === big);
   ok('空 body 返回空对象', JSON.stringify(await readBody(fakeReq([]))) === '{}');

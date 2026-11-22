@@ -1,13 +1,20 @@
 {
   "name": "cronhub",
-  "version": "1.1.0",
-  "description": "在线运行的定时任务控制中心：签到、提醒、执行日志",
+  "version": "1.2.0",
+  "description": "自托管的定时任务控制台：HTTP 多步骤 / JS 脚本 / 执行日志 / 多通道通知",
   "main": "server.js",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lemon225/cronhub.git"
+  },
+  "homepage": "https://github.com/lemon225/cronhub#readme",
   "scripts": {
     "start": "node watchdog.cjs",
     "start:bare": "node server.js",
-    "test": "node tests/run.cjs"
+    "test": "node tests/run.cjs",
+    "build": "node build.js"
   },
   "engines": {
     "node": ">=18"

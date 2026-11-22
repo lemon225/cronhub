@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CronHub · 定时任务控制中心</title>
+<script>(function(){try{var t=localStorage.getItem('cronhub.theme');if(t!=='light'&&t!=='dark')t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.setAttribute('data-theme',t)}catch(e){}})();</script>
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='24' fill='%232563eb'/%3E%3Ccircle cx='50' cy='50' r='26' fill='none' stroke='white' stroke-width='7'/%3E%3Cpath d='M50 50 V32' stroke='white' stroke-width='7' stroke-linecap='round'/%3E%3Cpath d='M50 50 L64 58' stroke='white' stroke-width='7' stroke-linecap='round'/%3E%3C/svg%3E">
 </head>
@@ -96,6 +97,9 @@
       </div>
       <div class="topbar-right">
         <div class="clock" id="clock">--:--:--</div>
+        <button class="btn btn--ghost" id="themeBtn" title="切换深浅主题" aria-label="切换深浅主题">
+          <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+        </button>
         <button class="btn btn--ghost" id="refreshBtn" title="刷新数据">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v6h-6"/></svg>
         </button>
@@ -114,6 +118,22 @@
 
         <!-- 近 24 小时运行指标（第十八批）：有数据才显示，空站不占位 -->
         <section class="metric-strip" id="metricStrip" hidden aria-label="近 24 小时运行指标"></section>
+
+        <section class="card archive-card" id="archiveCard" hidden>
+          <div class="card-head">
+            <h3>近 7 天数据归档</h3>
+            <button class="link-btn" data-act="archive-all">查看周报</button>
+          </div>
+          <div class="archive-strip" id="archiveStrip"></div>
+        </section>
+
+        <section class="card monitor-card" id="monitorCard">
+          <div class="card-head">
+            <h3>云端状态</h3>
+            <button class="link-btn" id="monitorProbeBtn">立即体检</button>
+          </div>
+          <div class="monitor-grid" id="monitorGrid"></div>
+        </section>
 
         <div class="grid-2">
           <div class="card">
@@ -891,8 +911,20 @@
             <div class="card-head"><h3>数据管理</h3><span class="hint" id="dataEntryHint">—</span></div>
             <div class="row-actions">
               <button class="btn btn--ghost btn--sm" id="exportData">导出 JSON</button>
+              <button class="btn btn--ghost btn--sm" id="importData">导入任务</button>
+              <input type="file" id="importFile" accept="application/json,.json" hidden>
             </div>
-            <p class="hint hint--block">数据保存在服务端 <code>data/state.json</code>，重启不丢。</p>
+            <p class="hint hint--block">导入只恢复任务（含配置、凭据引用），按名称匹配覆盖同名任务、其余新建；不影响日志与归档。数据保存在服务端 <code>data/state.json</code>，重启不丢。</p>
+          </div>
+
+          <div class="card" id="openApiCard">
+            <div class="card-head"><h3>只读 API Token</h3><span class="hint" id="openApiStatus">—</span></div>
+            <div class="row-actions">
+              <button class="btn btn--ghost btn--sm" id="openApiGen">生成 / 轮换</button>
+              <button class="btn btn--ghost btn--sm" id="openApiClose" hidden>关闭</button>
+            </div>
+            <p class="hint hint--block">给远程 CLI 或脚本用的只读凭据。用 <code>?token=你的Token</code> 调用 <code>/api/open/tasks</code>、<code>/api/open/state</code>、<code>/api/open/health</code>、<code>/api/open/archive</code>（托管网关会改写 Authorization 头，须用 URL 参数传）；只可读、不可改，每分钟限 60 次。明文只显示一次。</p>
+            <pre class="code-block" id="openApiTokenBox" hidden></pre>
           </div>
         </div>
 
@@ -932,6 +964,27 @@
     <div class="modal-foot">
       <span class="hint" id="tlFootHint">执行记录保存在 state.json，最多保留最近若干条</span>
       <button class="btn btn--ghost btn--sm btn--danger" id="tlClear">清空执行记录</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="archiveModal" hidden>
+  <div class="modal-mask" data-ar-close></div>
+  <div class="modal-panel" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h3 id="arTitle">数据归档 · 周报</h3>
+      <button class="icon-btn" data-ar-close aria-label="关闭">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="tl-summary" id="arSummary"></div>
+      <div class="ar-trend" id="arTrend" hidden></div>
+      <div class="tl-list" id="arList"></div>
+    </div>
+    <div class="modal-foot">
+      <span class="hint" id="arFootHint">归档只留最近 30 天，每天的结果不会被日志滚动冲掉</span>
+      <button class="btn btn--ghost btn--sm" id="arRefresh">刷新</button>
     </div>
   </div>
 </div>
@@ -1027,11 +1080,17 @@
           </div>
           <div class="field"><label>请求地址</label><input type="text" id="fUrl" placeholder="https://example.com/api/checkin"></div>
         </div>
-        <div class="field-row field-row--pair">
+        <div class="field">
+          <label>脚本内容 <span class="label-hint">青龙式 JS：填了就执行脚本，忽略上面的请求地址</span></label>
+          <textarea id="fScript" rows="7" maxlength="20000" spellcheck="false" placeholder="// 可用：fetch(url, opts)、env.KEY、console.log()、wait(ms)、URL、crypto&#10;const r = await fetch(env.API + '/checkin');&#10;console.log(await r.text());"></textarea>
+          <p class="field-note">在独立线程里运行，只提供 fetch / console / env / wait / setTimeout / URL / URLSearchParams / Headers / TextEncoder / crypto / btoa 等能力；<b>不可信脚本请勿运行</b>。可用 <code>{{变量名}}</code> 或 <code>env.变量名</code> 读环境变量，输出作为通知正文。等待请写 <code>wait(毫秒)</code>：<code>sleep(数字)</code> 会被网关 WAF 当成注入特征拦下。脚本任务默认给 60 秒，贴进脚本后「单次超时」会自动抬到 60。</p>
+        </div>
+        <div class="field-row">
           <div class="field"><label>期望状态码</label><input type="number" id="fExpect" value="200"></div>
           <div class="field"><label>也算成功</label><input type="text" id="fAlsoOk" placeholder="400,409"></div>
+          <div class="field"><label>单次超时（秒）</label><input type="number" id="fTimeoutSec" min="3" max="300" value="15"></div>
         </div>
-        <p class="field-note field-note--tight">「也算成功」留空即只看期望值。</p>
+        <p class="field-note field-note--tight">「也算成功」留空即只看期望值。超时对脚本同样生效，最长 300 秒；到点强制终止，不会卡住后面的任务。</p>
         <div class="field-row field-row--pair">
           <div class="field"><label>失败自动重试</label>
             <select id="fRetryTimes">
@@ -1064,7 +1123,7 @@
           <div class="row-actions">
             <button class="btn btn--ghost btn--sm" type="button" id="addStep">+ 添加步骤</button>
           </div>
-          <p class="field-note">留空只发上面这一个请求；填了步骤就按步骤走。</p>
+          <p class="field-note">留空只发上面这一个请求；填了步骤就按步骤走。「提取字段」把这一步响应里的值留给后面的步骤：填 <code>token=data.token</code>，下一步的地址/请求头/请求体里就能写 <code>{{step1.token}}</code> 或 <code>{{这一步的名字.token}}</code>。JSON 正文里引用含引号的变量请写 <code>{{json:变量名}}</code>，值会自动转义。</p>
         </div>
       </div>
 
@@ -1109,6 +1168,42 @@
         <span class="switch-text">服务中断后不自动补跑</span>
       </label>
       <p class="field-note">默认会补：服务重启或休眠唤醒后，错过的那一次会错峰补上（串行 + 随机抖动）。超过 2 小时、或距上次执行不足 1 分钟则不补。下单、抽奖这类「一次都不能重跑」的任务请打开本开关。</p>
+
+      <div class="field-row" id="fDependsRow">
+        <div class="field">
+          <label>前置任务（成功后才跑）</label>
+          <select id="fDependsOn"><option value="">无依赖</option></select>
+        </div>
+        <div class="field" style="max-width:130px">
+          <label>有效窗口</label>
+          <select id="fDependsHours">
+            <option value="6">6 小时</option>
+            <option value="12">12 小时</option>
+            <option value="24" selected>24 小时</option>
+            <option value="48">48 小时</option>
+          </select>
+        </div>
+      </div>
+      <p class="field-note">选了前置任务后，只有它在窗口内成功跑过，本任务才执行；手动「立即执行」不受限制。</p>
+
+      <div class="field-row" id="fRandomDelayRow">
+        <div class="field">
+          <label>随机延迟（秒）</label>
+          <div class="range-pair">
+            <input type="number" id="fDelayMin" min="0" max="3600" placeholder="最少" aria-label="最少延迟秒数">
+            <span class="range-sep">—</span>
+            <input type="number" id="fDelayMax" min="0" max="3600" placeholder="最多" aria-label="最多延迟秒数">
+          </div>
+        </div>
+      </div>
+      <p class="field-note">到点后在这个区间内随机推迟执行（青龙式防风控）。只对 cron 节奏生效，留空即不延迟；手动「立即执行」不受影响。</p>
+
+      <label class="switch switch--block">
+        <input type="checkbox" id="fArchive" checked>
+        <span class="track"></span>
+        <span class="switch-text">归档每次执行结果</span>
+      </label>
+      <p class="field-note">归档独立于通知：关掉通知也会留。保留最近 30 天，可在任务卡「数据归档」看趋势与周报。</p>
 
       <div class="notify-block">
         <label class="switch switch--block">

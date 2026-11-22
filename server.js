@@ -15,15 +15,18 @@ const { execFile } = require('node:child_process');
 const net = require('node:net');
 const https = require('node:https');
 const dns = require('node:dns');
+const { Worker } = require('node:worker_threads');
 /*
  * 脱敏函数提到文件顶部：pushSysLog（第 386 行附近）是**所有**日志的入口，
  * 它必须能在任何调用点之前用上 scrubText —— 放在文件后半段 require 会撞上
  * const 的暂时性死区（TDZ），只能写成惰性 require，那比这样差。
  */
 const { scrubText: scrubLogText } = require('./lib/credential-vault');
+// 私网判定与脚本 worker 共用同一份实现，避免两处判据分叉
+const { isPrivateHost } = require('./lib/net-guard.cjs');
 
 /* 版本标记：发布后 GET /api/health 看 build，确认云端 Node 侧跑的是不是最新代码 */
-const SMS_BUILD = 'audit-batch-38';
+const SMS_BUILD = 'audit-batch-68';
 
 const PORT = Number(process.env.PORT || 8787);
 const ROOT = __dirname;
@@ -351,6 +354,16 @@ const MAX_LOGS = 300;
 const LOG_RETENTION_DAYS = 7;
 const LOG_RETENTION_MS = LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
+/*
+ * 执行归档（第四十一批）：与「日志 / 通知」平行的长期数据层。
+ * 日志 7 天 300 条是排障用的，通知 200 条是展示用的，都不适合拿来算「这周油价涨了几次」——
+ * 前者会被冲掉，后者只留最新。归档按任务留最近 30 天、每任务最多 120 条，
+ * 只存成功执行的正文与关键数值，不存响应全文（那玩意儿一条就几 KB，300 条能撑爆 state）。
+ */
+const ARCHIVE_DAYS = 30;
+const ARCHIVE_PER_TASK = 120;
+const ARCHIVE_RETENTION_MS = ARCHIVE_DAYS * 24 * 60 * 60 * 1000;
+
 /** 删掉超过保留期的日志条目，返回删了多少条（用于决定是否落盘）。 */
 function pruneExpiredLogs() {
   const cutoff = Date.now() - LOG_RETENTION_MS;
@@ -498,6 +511,11 @@ const DEFAULT_SETTINGS = {
    * 任务里的 {{KEY}} 占位符执行前自动替换（url / headers / body / 步骤均生效）。
    */
   envVars: [],
+  /*
+   * 只读 Open API：给远程 CLI / 本机执行器用的第三方凭据。
+   * 只存 token 的 SHA256，明文仅在生成时返回一次；默认关闭。
+   */
+  openApi: { enabled: false, tokenHash: '', createdAt: '' },
   smtp: { enabled: false, host: '', port: 465, user: '', pass: '', from: '', to: '' },
   /*
    * 凭据自动续期（WorkBuddy 专用）。
@@ -607,7 +625,7 @@ function nowISO() {
 }
 
 function emptyState() {
-  return { tasks: [], notifications: [], logs: [], settings: { ...DEFAULT_SETTINGS }, smsRelay: [], keepAliveLog: [], auth: null, authLog: [], systemLogs: [], deadLetters: [], smsAuthStats: null, smsRecords: [], smsBindings: null };
+  return { tasks: [], notifications: [], logs: [], archives: [], settings: { ...DEFAULT_SETTINGS }, smsRelay: [], keepAliveLog: [], auth: null, authLog: [], systemLogs: [], deadLetters: [], smsAuthStats: null, smsRecords: [], smsBindings: null };
 }
 
 let state = emptyState();
@@ -646,6 +664,8 @@ function loadState() {
       tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
       notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [],
       logs: Array.isArray(parsed.logs) ? parsed.logs : [],
+      // 执行归档：老 state 没这个字段，读成空数组即可，不影响任何既有任务
+      archives: Array.isArray(parsed.archives) ? parsed.archives : [],
       settings: deepMerge(DEFAULT_SETTINGS, parsed.settings || {}),
       // 短信转发中转记录：必须一起读回，否则重启后中转日志/通知中心会凭空清空
       smsRelay: Array.isArray(parsed.smsRelay) ? parsed.smsRelay : [],
@@ -1342,6 +1362,24 @@ function nextRunsOf(sched, from, count = 3) {
   return out;
 }
 
+/*
+ * 任务级随机延迟（青龙 task 命令的核心特性）：到点后随机推迟几秒再执行，防整点齐发被风控。
+ * 只认 cron 节奏 —— interval 的 nextRun 基于「上次执行后」推算，叠加偏移会让周期持续漂移。
+ * 偏移非负、上限 3600 秒，远小于常见 cron 周期，因此 computeNextRun 以 plannedAt 为基准
+ * 算下一次时不会跳过周期。rand 可注入，便于测试断言。
+ */
+function randomDelayMs(task, rand) {
+  const r = task && task.config && task.config.randomDelaySec;
+  if (!r) return 0;
+  const min = Math.max(0, Math.min(3600, Number(r.min) || 0));
+  const max = Math.max(min, Math.min(3600, Number(r.max) || 0));
+  if (max <= 0) return 0;
+  const scheds = taskSchedules(task);
+  if (!scheds.length || scheds.some((s) => s.mode !== 'cron')) return 0;
+  const rnd = typeof rand === 'function' ? rand : Math.random;
+  return Math.round((min + rnd() * (max - min)) * 1000);
+}
+
 /** 多节奏任务取「所有节奏里最近的一次」。 */
 function computeNextRun(task, from) {
   const fromD = from || new Date();
@@ -1349,6 +1387,10 @@ function computeNextRun(task, from) {
   for (const sched of taskSchedules(task)) {
     const n = nextRunOf(sched, fromD);
     if (n && (!best || n < best)) best = n;
+  }
+  if (best) {
+    const delay = randomDelayMs(task);
+    if (delay > 0) best = new Date(best.getTime() + delay);
   }
   return best;
 }
@@ -1367,6 +1409,209 @@ function pushNotification({ level = 'info', title, body, source = 'system', task
   if (state.notifications.length > 200) state.notifications.length = 200;
   saveState();
   return item;
+}
+
+/* ------------------------------------------------------------ 执行归档 */
+
+/*
+ * 从步骤 JSON 里抽可直接作图的数值。
+ * 只收标量数字与数字字符串，数组最多展开 24 项、深度最多 4 层 —— 逐小时预报
+ * 那种 24×N 的接口若不限深，一条归档就能塞进几千个键，把 state 撑爆。
+ */
+function archiveValuesOf(steps, depth = 0, out = {}) {
+  if (depth > 4 || Object.keys(out).length >= 40) return out;
+  for (const s of steps || []) {
+    const json = s && s.json;
+    if (!json || typeof json !== 'object') continue;
+    const walk = (node, d) => {
+      if (!node || typeof node !== 'object' || d > 4 || Object.keys(out).length >= 40) return;
+      for (const [k, v] of Object.entries(node)) {
+        if (v == null) continue;
+        if (typeof v === 'number' && Number.isFinite(v)) { out[k] = v; continue; }
+        if (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v)) { out[k] = Number(v); continue; }
+        if (Array.isArray(v)) {
+          if (v.length > 24) continue;
+          for (const one of v) walk(one, d + 1);
+          continue;
+        }
+        if (typeof v === 'object') walk(v, d + 1);
+      }
+    };
+    walk(json, 0);
+  }
+  return out;
+}
+
+/** 归档是否开启：老任务没配过就默认开，只有显式 false 才关。 */
+const archiveEnabled = (task) => {
+  const a = task && task.config && task.config.archive;
+  return !a || a.enabled !== false;
+};
+
+/** 写一条归档。失败也留（周报要能算成功率），但正文只留 AI 改写后的短文本。 */
+function recordArchive(task, { at, ok, trigger, duration, message, body, steps }) {
+  if (!archiveEnabled(task)) return null;
+  if (!Array.isArray(state.archives)) state.archives = [];
+  const cutoff = Date.now() - ARCHIVE_RETENTION_MS;
+  state.archives = state.archives.filter((a) => a && Date.parse(a.at) > cutoff);
+  const item = {
+    id: uid('arc'),
+    at: at || nowISO(),
+    taskId: task.id,
+    taskName: task.name,
+    ok: !!ok,
+    trigger: trigger || '',
+    duration: Number(duration) || 0,
+    body: clipBody(String(body || message || '').slice(0, 480), 600),
+  };
+  if (trigger === 'manual') item.manual = true;
+  const values = archiveValuesOf(steps);
+  if (Object.keys(values).length) item.values = values;
+  state.archives.unshift(item);
+  // 每任务独立限流：高频任务不能把低频任务（周报更关心）的归档挤掉
+  const perTask = new Map();
+  state.archives = state.archives.filter((a) => {
+    const n = (perTask.get(a.taskId) || 0) + 1;
+    if (n > ARCHIVE_PER_TASK) return false;
+    perTask.set(a.taskId, n);
+    return true;
+  });
+  return item;
+}
+
+/*
+ * 自然周口径（东八区，无夏令时）。
+ * 线上容器跑 UTC，直接 new Date().getDay() 会差 8 小时、周日晚的任务被算进下一周，
+ * 所以先把时间戳整体平移 +8h，用「自 epoch 起第几天」算，再平移回来 —— 不依赖进程时区。
+ * offsetWeeks：-1 = 上一自然周（周报默认），0 = 本周至今。
+ * 1970-01-01 是周四，故 (localDay + 3) % 7 得到 周一=0。
+ */
+const CN_TZ_OFFSET_MS = 8 * 3600 * 1000;
+function weekRangeCN(offsetWeeks = -1, now = Date.now()) {
+  const dayMs = 86400000;
+  const localDay = Math.floor((now + CN_TZ_OFFSET_MS) / dayMs);
+  const dow = (((localDay + 3) % 7) + 7) % 7;
+  const monday = localDay - dow;
+  const startDay = monday + Number(offsetWeeks || 0) * 7;
+  const fromMs = startDay * dayMs - CN_TZ_OFFSET_MS;
+  const toMs = (startDay + 7) * dayMs - CN_TZ_OFFSET_MS;
+  return { fromMs, toMs, partial: Number(offsetWeeks) === 0, now };
+}
+
+/** 东八区日期片段：用于「11.10-11.16」这类标签，避免用容器本地时区。 */
+function cnDayLabel(ms) {
+  const d = new Date(ms + CN_TZ_OFFSET_MS);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getUTCMonth() + 1)}.${p(d.getUTCDate())}`;
+}
+
+/** 归档周报：按任务聚合最近 N 天，给任务卡入口与主页展示共用。range 存在时按绝对区间过滤。 */
+function archiveSummary(days = 7, taskId = '', range = null) {
+  const d = Math.max(1, Math.min(30, Number(days) || 7));
+  const ranged = !!(range && Number.isFinite(range.fromMs) && Number.isFinite(range.toMs));
+  const cutoff = ranged ? range.fromMs : Date.now() - d * 24 * 60 * 60 * 1000;
+  const endMs = ranged ? range.toMs : Infinity;
+  // 单任务明细必须连统计一起过滤，否则弹窗会出现「归档 0 / 成功 4 / 任务 2」
+  const items = (state.archives || []).filter((a) => {
+    if (!a) return false;
+    const at = Date.parse(a.at);
+    if (!Number.isFinite(at)) return false;
+    if (at < cutoff || at >= endMs) return false;
+    return !taskId || a.taskId === taskId;
+  });
+  const byTask = new Map();
+  const byDay = new Map();
+  for (const a of items) {
+    const key = String(a.taskId || a.taskName || '');
+    let row = byTask.get(key);
+    if (!row) {
+      row = { taskId: a.taskId, name: a.taskName, runs: 0, ok: 0, fail: 0, lastAt: a.at, lastBody: a.body || '', values: [] };
+      byTask.set(key, row);
+    }
+    row.runs += 1;
+    if (a.ok) row.ok += 1; else row.fail += 1;
+    if (Date.parse(a.at) >= Date.parse(row.lastAt)) {
+      row.lastAt = a.at;
+      row.lastBody = a.body || '';
+    }
+    // 数值趋势：每个任务最多留 12 个采样点，按时间正序交给前端画折线
+    if (a.values && Object.keys(a.values).length) {
+      row.values.push({ at: a.at, v: a.values });
+      if (row.values.length > 12) row.values.shift();
+    }
+    const day = String(a.at).slice(0, 10);
+    byDay.set(day, (byDay.get(day) || 0) + 1);
+  }
+  const tasks = [...byTask.values()].sort((x, y) => Date.parse(y.lastAt) - Date.parse(x.lastAt));
+  return {
+    days: d,
+    total: items.length,
+    ok: items.filter((a) => a.ok).length,
+    fail: items.filter((a) => !a.ok).length,
+    byDay: [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([day, runs]) => ({ day, runs })),
+    tasks,
+    ...(ranged ? { from: new Date(cutoff).toISOString(), to: new Date(endMs).toISOString() } : {}),
+  };
+}
+
+/*
+ * 周报正文：纯服务端排版，数字全部来自 archiveSummary —— 不进 AI，绝不编造。
+ * 用于「每周周报」任务：任务步骤 GET /api/report/weekly，配置 noticeRaw 原样透传。
+ * 短行 + 纯文本，短信/NotifyMe/站内都能读；不用 markdown 表格（短信里会散架）。
+ *
+ * 口径（2026-11-21 改）：默认按「上一自然周」统计（周一 00:00 – 周日 24:00，东八区），
+ * 因为「每周一早上发」的滚动 7 天窗口会把上上周日、本周一各切一刀，
+ * 跟用户脑子里的「上周」对不上。要看本周至今传 week:'this'；
+ * 老的滚动口径保留在 week:'rolling'（days 参数仍然生效）。
+ */
+function buildWeeklyReport(opts = {}) {
+  const o = (typeof opts === 'number') ? { days: opts } : (opts || {});
+  const mode = o.week === 'rolling' ? 'rolling' : (o.week === 'this' ? 'this' : 'last');
+  let range = null;
+  if (mode !== 'rolling') {
+    range = weekRangeCN(mode === 'this' ? 0 : -1);
+    // 本周还没走完：截止到此刻，避免把未来时间算进分母
+    if (range.partial) range.toMs = Math.min(range.toMs, Date.now() + 1000);
+  }
+  const d = Math.max(1, Math.min(30, Number(o.days) || 7));
+  const sm = archiveSummary(d, '', range);
+  const fromMs = range ? range.fromMs : Date.now() - d * 24 * 3600 * 1000;
+  const toMs = range ? range.toMs : Date.now();
+  const span = range ? `${cnDayLabel(fromMs)}-${cnDayLabel(toMs - 1)}` : `${cnDayLabel(fromMs)}-${cnDayLabel(toMs)}`;
+  const rate = sm.total ? Math.round((sm.ok / sm.total) * 100) : 0;
+  const title = mode === 'rolling' ? `📊 CronHub 周报 ${span}` : `📊 CronHub 周报 ${span}（自然周）`;
+  const scope = mode === 'this' ? '本周' : (mode === 'rolling' ? '近 ' + d + ' 天' : '上周');
+  const lines = [
+    title,
+    `执行 ${sm.total} 次 · 成功 ${sm.ok} · 失败 ${sm.fail} · 成功率 ${rate}%`,
+  ];
+  const ranked = [...sm.tasks].sort((a, b) => (b.fail - a.fail) || (b.runs - a.runs));
+  if (ranked.length) {
+    lines.push('');
+    for (const t of ranked) {
+      const mark = t.fail ? '⚠️' : '✅';
+      lines.push(`${mark} ${t.name} ${t.runs}次 成${t.ok}/败${t.fail}`);
+    }
+  }
+  if (sm.fail) {
+    const bad = ranked.filter((t) => t.fail);
+    lines.push('');
+    lines.push(`${scope} ${bad.length} 项任务出现失败，请到「数据归档」查看明细。`);
+  } else if (sm.total) {
+    lines.push('');
+    lines.push(`${scope}全部执行成功。`);
+  } else {
+    lines.push('');
+    lines.push(`${scope}暂无执行记录。`);
+  }
+  return {
+    text: lines.join('\n'),
+    mode,
+    week: mode === 'rolling' ? '' : mode,
+    from: new Date(fromMs).toISOString(),
+    to: new Date(toMs).toISOString(),
+    summary: sm,
+  };
 }
 
 /** 取 URL 的 host；解析不了返回空串（当作"只填了网关根域"处理） */
@@ -1580,16 +1825,40 @@ function sanitizeEnvVars(input) {
     .slice(0, 100);
 }
 
-/** 把 {{KEY}} 占位符换成环境变量值（仅启用的变量；KEY 不区分大小写）。 */
-function applyEnvVars(str) {
+/**
+ * 把 {{KEY}} 占位符换成环境变量值（仅启用的变量；KEY 不区分大小写）。
+ *
+ * extra 是「运行时变量」：多步骤任务里前面步骤提取出来的值（见 runHttpSteps），
+ * 用 {{step1.token}} / {{取令牌.token}} 引用。优先级高于全局环境变量 —— 同名的
+ * 运行期值就是这一步刚拿到的东西，用全局值去覆盖它毫无意义。
+ *
+ * {{json:KEY}} 会先做 JSON 字符串转义再插入，专治「变量值里带引号把请求体打坏」：
+ *   {"pwd":"{{PWD}}"}  PWD=a"b  →  {"pwd":"a"b"}  → 上游 400
+ *   {"pwd":"{{json:PWD}}"}     →  {"pwd":"a\"b"} → 正确
+ */
+function applyEnvVars(str, extra) {
   const raw = String(str || '');
   if (!raw.includes('{{')) return raw;
   const map = new Map();
   for (const v of state.settings.envVars || []) {
     if (v.enabled && v.value != null) map.set(v.key.toUpperCase(), v.value);
   }
+  if (extra && typeof extra === 'object') {
+    for (const [k, v] of Object.entries(extra)) {
+      if (v != null) map.set(String(k).toUpperCase(), String(v));
+    }
+  }
   if (!map.size) return raw;
-  return raw.replace(/\{\{\s*(\w+)\s*\}\}/g, (m, key) => (map.has(key.toUpperCase()) ? map.get(key.toUpperCase()) : m));
+  // key 允许点号与中文：全局变量名被 sanitizeEnvVars 限成 \w，点号/中文只可能来自运行期变量
+  // （{{step1.token}}、{{取令牌.token}}）。匹配不到就原样保留，不会误伤其它花括号文本。
+  return raw.replace(/\{\{\s*(json:)?\s*([^{}\s]+?)\s*\}\}/gi, (m, isJson, key) => {
+    const k = String(key).toUpperCase();
+    if (!map.has(k)) return m;
+    const val = map.get(k);
+    if (!isJson) return val;
+    // 取 JSON 字符串的内部（去掉首尾引号），保留 \" \\ \n 这些转义
+    return JSON.stringify(val).slice(1, -1);
+  });
 }
 
 /* ---------------------------------------------------------------- NotifyMe 手机推送 */
@@ -2196,6 +2465,9 @@ function maskSettings(st, opts) {
   out.smsActionToken = M(src.smsActionToken);
   const wk = src.wake || {};
   out.wake = { ...wk, token: plain ? String(wk.token || '') : (wk.token ? '••••••' : '') };
+  // Open API 只暴露开关与创建时间，token 哈希不外发（明文只在生成时返回一次）
+  const oa = src.openApi || {};
+  out.openApi = { enabled: !!oa.enabled, createdAt: oa.createdAt || '', configured: !!oa.tokenHash };
   return out;
 }
 
@@ -2563,6 +2835,115 @@ function companionSnapshot() {
   };
 }
 
+/*
+ * 云端合成探针（第四十一批）：手动点「立即体检」才主动打外部地址。
+ * 30 秒缓存防连点把上游打爆；只探用户配过的地址，结果只留状态码/耗时/摘要，
+ * 不存正文（天气接口的原始数据几 KB，存下来纯属浪费 state）。
+ */
+const monitorProbe = { at: null, results: [] };
+let monitorProbeRunning = false;
+let monitorProbeStartedAt = 0;
+async function runMonitorProbe(req) {
+  const now = Date.now();
+  const debug = /[?&]debug=1/.test(String((req && req.url) || ''));
+  if (monitorProbe.at && now - Date.parse(monitorProbe.at) < 30000) return monitorProbe;
+  if (monitorProbeRunning) {
+    /* 僵死保护：一旦中途抛错，标志位会永远停在 true，之后每次体检都返回空结果。
+       超过单轮上限（探针 8s 超时 + 串行开销）就当作上一轮已死，允许重跑。 */
+    if (now - monitorProbeStartedAt > 60000) monitorProbeRunning = false;
+    else return monitorProbe;
+  }
+  monitorProbeRunning = true;
+  monitorProbeStartedAt = now;
+  const targets = [];
+  const base = publicBase(req);
+  const sc = String(state.settings.sharecode || '').trim();
+  if (base) targets.push({ name: '本站', url: `${base}/api/health` + (sc ? `?sharecode=${sc}` : '') });
+  /*
+   * 短信中继单独补一条：它是短信的唯一出口，但地址存在 settings 里、不在任务列表，
+   * 靠下面「扫任务 URL」永远扫不到 —— 中继挂了体检仍报全绿，正是最该避免的漏报。
+   * 打 /__probe（只读自检，不碰网关、不消耗额度），带中继密钥才能拿到上游细节。
+   */
+  const relayCfg = state.settings.smsGatewayRelay || {};
+  const relayEps = relayEndpoints(relayCfg).slice(0, 2);
+  relayEps.forEach((ep, i) => {
+    let tag = '';
+    try { tag = new URL(ep).host.split('.')[0].slice(0, 12); } catch { /* 域名畸形留空 */ }
+    targets.push({
+      name: relayEps.length > 1 ? `短信中继${i + 1} ${tag}` : '短信中继',
+      url: ep + '/__probe',
+      headers: relayCfg.secret ? { 'X-Relay-Secret': String(relayCfg.secret) } : {},
+    });
+  });
+  // 指向本站的任务（比如周报任务自己调 /api/report/weekly）不算上游，
+  // 否则结果里会出现两行本站 —— 一行「本站」一行「上游 cronhub.app…」，纯噪音。
+  // 网关会把 Host 改写成沙箱内网域名，单看 base 排除不掉公网地址，
+  // 所以把设置里出现过的本站地址（siteBase / 保活探针 / 唤醒地址）全部收进来比对 hostname。
+  const selfHosts = new Set();
+  const addSelfHost = (u) => {
+    try {
+      const h = new URL(String(u || '')).hostname.toLowerCase();
+      if (h) selfHosts.add(h);
+    } catch { /* 空值或畸形地址跳过 */ }
+  };
+  addSelfHost(base);
+  addSelfHost(state.settings.siteBase);
+  addSelfHost((state.settings.keepWarm || {}).url);
+  addSelfHost((state.settings.wake || {}).url);
+  const selfHost = [...selfHosts].join(',');
+  const hosts = new Set();
+  for (const t of state.tasks || []) {
+    if (t.type !== 'http' || !t.enabled) continue;
+    const u = String((t.config && t.config.url) || '');
+    if (!/^https?:\/\//.test(u)) continue;
+    try {
+      const nu = new URL(u);
+      if (selfHosts.has(nu.hostname.toLowerCase())) continue;
+      const h = nu.origin;
+      if (hosts.has(h)) continue;
+      hosts.add(h);
+      targets.push({ name: '上游 ' + nu.hostname.slice(0, 24), url: u });
+    } catch { /* URL 畸形跳过 */ }
+    if (hosts.size >= 4) break;
+  }
+  const results = await Promise.all(targets.map(async (t) => {
+    const began = Date.now();
+    try {
+      const r = await fetch(t.url, { method: 'GET', signal: AbortSignal.timeout(8000), headers: { 'user-agent': 'CronHub-Monitor/1', ...(t.headers || {}) } });
+      /*
+       * 探针只测「网络可达」，不代表任务凭据可用：
+       * 和风、WorkBuddy 这类要鉴权的上游，裸请求必然 401/403，
+       * 但服务是活的，标成失败会让「立即体检」永远报错。
+       */
+      const auth = r.status === 401 || r.status === 403;
+      /*
+       * 本站判定：网关会把 Host 改写成沙箱内网域名（实测 base 是 3000-xxx.cloudstudio.club），
+       * 所以「按域名排除任务里的公网地址」永远匹配不上。改看响应体签名 ——
+       * 我们自己 /api/health 的 JSON 同时带 build 与 cronhubTimezone，命中即本站。
+       * 命中后从结果里剔除：能收到这次请求本身就证明公网入口是通的，再报一行纯噪音。
+       */
+      let self = false;
+      if (!(t.headers && t.headers['X-Relay-Secret'])) {
+        const peek = await r.text().catch(() => '');
+        try {
+          const j = JSON.parse(peek);
+          self = !!(j && j.ok === true && j.build && j.cronhubTimezone);
+        } catch { /* 非 JSON 响应，当普通上游 */ }
+      }
+      return { name: t.name, ok: r.ok || auth, status: r.status, ms: Date.now() - began, error: '', auth, self };
+    } catch (e) {
+      return { name: t.name, ok: false, status: 0, ms: Date.now() - began, error: String((e && e.message) || e).slice(0, 120) };
+    }
+  }));
+  const kept = results.filter((r) => !r.self);
+  monitorProbe.at = nowISO();
+  monitorProbe.results = kept;
+  // 排查用（?debug=1）：看清这一轮探了哪些地址、哪些被判定为本站剔除
+  if (debug) monitorProbe.debug = { base, selfHost, targets: targets.map((t) => `${t.name} ${t.url}`), self: results.filter((r) => r.self).map((r) => r.name) };
+  monitorProbeRunning = false;
+  return monitorProbe;
+}
+
 /* ---------------------------------------------------------------- AI 通知优化 */
 
 /** 统一的 JSON HTTP 客户端：超时 + 解析一次搞定，aiPolish / models 路由共用。 */
@@ -2661,6 +3042,9 @@ function aiRules(text) {
   // 其它任务（油价、热评、自检）的提示词不含这四个字，完全不受影响。
   if (/事实结论/.test(t)) {
     rules.push({ kind: 'fact-source', hard: true, label: '天气词 / 时段 / 预警出自结论区' });
+    // 反向漏网：「少云」被写成「空」时，词表里没有这个词，fact-source 抓不到 ——
+    // 现象是唯一不许改写的字段，改成同义说法也算改，所以逐字核对。
+    rules.push({ kind: 'fact-phrase', hard: true, label: '现象照抄结论区' });
     // 现象词对得上，不代表时刻对得上：「今晚18时起，22时停」里没有一个天气词
     // 是编的，时刻却全是编的。起止改由结论区唯一的逐小时区间卡死。
     rules.push({ kind: 'fact-band', hard: true, label: '降水起止与结论区一致' });
@@ -2677,6 +3061,13 @@ function aiFabricationViolations(violations) {
 /** 去空白字数：用户数的是可见字，空格与换行不计。 */
 const aiCharCount = (s) => [...String(s || '').replace(/\s+/g, '')].length;
 
+/* 模型偶尔把换行写成「/n」（斜杠代替反斜杠）—— 实测 11-18 20:14 的天气推送
+ * 正文以「/n⛅ 今晚…」开头，整条第一行带着两个多余字符。
+ * 只在斜杠后面紧跟中文或 emoji 时才当换行：URL 里的 /note、/news 不能被切开。 */
+function repairNewlines(text) {
+  return String(text || '').replace(/\/n(?=[^\x00-\x7F])/g, '\n').replace(/^\n+/, '');
+}
+
 /* 行首图标：含 VS16 / ZWJ 组合。「全篇不重复」以前只是提示词里一句话，
  * 模型照样三行都用 ❄️；缓存只能保证不摇，不能保证第一次就对。 */
 const AI_ICON_RE = /\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*/u;
@@ -2691,6 +3082,47 @@ function aiIconPool(text) {
   const row = [...s.matchAll(new RegExp(`行[:：]\\s*(${AI_ICON_RE.source})`, 'gu'))]
     .map((m) => m[1]);
   return [...new Set([...row, ...[...s.matchAll(AI_ICON_ANY)].map((m) => m[0]), ...AI_ICON_FALLBACK])];
+}
+
+/* 图标语义对齐：模型会把模板行首的图标当骨架一起抄（实测 -6.9°C 晴间多云也写 ❄️）。
+ * 现象词本来就从结论区抄来，图标只是它的视觉标签，不必再让模型判断一次 ——
+ * 这里直接按本行现象词定图标，行首缺图标也一并补上。 */
+const WEATHER_ICON_MAP = [
+  [/雨夹雪|阵雪|小雪|中雪|大雪|暴雪|雪/, ['❄️', '🌨️']],
+  [/雷/, ['⛈️']],
+  [/雨/, ['🌧️', '🌦️']],
+  [/雾|霾|浮尘|沙尘/, ['🌫️', '😷']],
+  [/晴间多云|少云|多云/, ['⛅', '☁️']],
+  [/阴/, ['☁️', '⛅']],
+  [/晴/, ['☀️', '⛅']],
+];
+
+function alignWeatherIcons(text) {
+  const lines = String(text || '').split('\n');
+  const seen = new Set();
+  // 第 3 行（建议 / 预警）不在对齐范围内，但它已经占着的图标不能再用，
+  // 否则「明天小雪 → ❄️」会和行尾已有的 ❄️ 撞车。
+  for (const l of lines.slice(2)) {
+    const m = l.match(AI_ICON_HEAD);
+    if (m) seen.add(aiIconKey(m[2]));
+  }
+  return lines.map((l, i) => {
+    if (i > 1) return l;                     // 只动前两行日期行，建议/预警行原样保留
+    const m = l.match(AI_ICON_HEAD);
+    const lead = m ? m[1] : (l.match(/^\s*/) || [''])[0];
+    const rest = m ? m[4] : l.slice(lead.length);
+    if (!/今晚|今夜|明天|明日|今天/.test(rest)) return l;
+    let cands = null;
+    for (const [re, list] of WEATHER_ICON_MAP) if (re.test(rest)) { cands = list; break; }
+    if (!cands) return l;
+    // 「今晚晴」是夜景，白天的 ☀️ 会显得刺眼；两行同晴时靠候选表避开重复。
+    if (/今晚|今夜/.test(rest) && cands[0] === '☀️') cands = ['🌙', '☀️'];
+    const pick = cands.find((c) => !seen.has(aiIconKey(c))) || cands[0];
+    const key = aiIconKey(pick);
+    if (m && aiIconKey(m[2]) === key) { seen.add(key); return l; }
+    seen.add(key);
+    return lead + pick + (m ? m[3] : ' ') + rest;
+  }).join('\n');
 }
 
 /** 重复图标按池顺序替换成未用过的那个；不重排内容、不改图标数量。 */
@@ -2772,6 +3204,23 @@ function aiReview(body, rules, factText) {
           ...levels.filter((l) => !ft.includes(l)),
         ])];
         if (missing.length) add(`出现事实结论区没有的内容「${missing.slice(0, 3).join('、')}」`, r.hard);
+      }
+    } else if (r.kind === 'fact-phrase') {
+      /*
+       * 正向核对，只核一个字段：结论区写「明天 现象=少云」，前两行的那一行
+       * 必须原样出现「少云」。实测 11-18 20:17 模型写成「明天空」——「空」不在
+       * 天气词表里，上面那条反查完全看不见，只能靠逐字对。
+       * 行被整行省掉时不判（line-count 与「不删现象」各管一头），现象为空也不判。
+       */
+      const ft = String(factText || '');
+      if (!/【事实结论/.test(ft)) continue;
+      for (const m of ft.matchAll(/(今晚|明天)[^\n]*?现象=([^\s\n]+)/g)) {
+        const day = m[1];
+        const word = m[2];
+        if (!word || word === '无') continue;
+        const line = lines.slice(0, 2).find((l) => l.includes(day));
+        if (!line || line.includes(word)) continue;
+        add(`「${day}」现象应照抄「${word}」，正文里没有这个词`, r.hard);
       }
     } else if (r.kind === 'fact-band') {
       /*
@@ -2953,13 +3402,19 @@ async function aiPolish(cfg, opts) {
     // 模型有时把换行写成字面 \n 而非 JSON 转义，统一还原成真换行，
     // 否则分行卡片式会退化成一整段。不再静默截到 800 字：
     // 正常输出远短于此，异常跑飞时才裁，且裁了会明确标注。
-    let bodyText = String(parsed.body || '').replace(/\\n/g, '\n');
+    let bodyText = repairNewlines(String(parsed.body || '').replace(/\\n/g, '\n'));
     if (tightUnits) {
       bodyText = bodyText.replace(/(\d)\s+(°C)/g, '$1$2');
+      // 「最低 -5.7°C」：温度词和数字之间也别留缝（实测 11-18 20:27 那条）。
+      bodyText = bodyText.replace(/(最低|最高)\s+(-?\d)/g, '$1$2');
       // 「-1.5 ~ 6°C」：骨架的「数字与单位留空格」会让模型顺手把 ~ 也撑开。
       bodyText = bodyText.replace(/\s*~\s*/g, '~');
     }
-    if (needUniqueIcons) bodyText = dedupeIcons(bodyText, iconPool);
+    if (needUniqueIcons) {
+      bodyText = dedupeIcons(bodyText, iconPool);
+      // 去重在前、对齐在后：去重只保证不重样，对齐保证图标说的是本行天气。
+      bodyText = alignWeatherIcons(bodyText);
+    }
     bodyText = orderBandAfterDay(bodyText);
     return { title: String(parsed.title).slice(0, 40), body: clipBody(bodyText) };
   };
@@ -4339,40 +4794,12 @@ async function fetchNoProxy(url, init) {
  * 云端实例如果能被外部触发建任务，理论上可以拿它当跳板打内网 / 云元数据。
  * 但本项目是自用开放站，也可能真有内网任务，所以**默认关闭**：
  *   CRONHUB_BLOCK_PRIVATE_URL=1 或 settings.blockPrivateUrls = true 才启用。
- * 只按字面 host 判断、不解析 DNS：不防 DNS 重绑定，也不追 302 跳转后的地址。
- * 定位是「防手滑填错 / 挡住最直白的探测」，不是完整的 SSRF 防御体系。
+ * 判据本体在 lib/net-guard.cjs（脚本 worker 也要用同一份）。这里只负责开关。
  */
 function privateUrlGuardOn() {
   const env = process.env.CRONHUB_BLOCK_PRIVATE_URL;
   if (env != null && String(env).trim() !== '') return /^(1|true|on|yes)$/i.test(String(env).trim());
   return !!(state.settings && state.settings.blockPrivateUrls);
-}
-
-function isPrivateHost(host) {
-  const h = String(host || '').replace(/^\[|\]$/g, '').toLowerCase();
-  if (!h) return true;
-  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
-  if (h === 'metadata.google.internal' || h === 'metadata') return true;
-  if (net.isIPv6(h)) {
-    return h === '::1' || h === '::'
-      || h.startsWith('fc') || h.startsWith('fd')          // fc00::/7 唯一本地
-      || /^fe[89ab]/.test(h)                               // fe80::/10 链路本地
-      || h.startsWith('::ffff:');                          // IPv4 映射
-  }
-  if (net.isIPv4(h)) {
-    const p = h.split('.').map(Number);
-    return p[0] === 0 || p[0] === 10 || p[0] === 127 || p[0] >= 224
-      || (p[0] === 169 && p[1] === 254)                    // 含 169.254.169.254 元数据
-      || (p[0] === 172 && p[1] >= 16 && p[1] <= 31)
-      || (p[0] === 192 && p[1] === 168)
-      || (p[0] === 100 && p[1] >= 64 && p[1] <= 127)
-      || (p[0] === 192 && p[1] === 0 && p[2] === 0)
-      || (p[0] === 192 && p[1] === 0 && p[2] === 2)
-      || (p[0] === 198 && (p[1] === 18 || p[1] === 19))
-      || (p[0] === 198 && p[1] === 51 && p[2] === 100)
-      || (p[0] === 203 && p[1] === 0 && p[2] === 113);
-  }
-  return false;
 }
 
 function assertUrlAllowed(raw, taskName) {
@@ -4392,16 +4819,169 @@ function assertUrlAllowed(raw, taskName) {
   }
 }
 
-async function runHttpTask(task) {
+/*
+ * ============================================================
+ * 脚本步骤（青龙式）：用户 JS 跑在独立的 worker 线程里。
+ *
+ * 为什么不在主进程里跑（2026-11-21 实测）：
+ *   vm 的 timeout 只管同步段。脚本写 `await sleep(10); while(true){}`，
+ *   vm 超时早就过了，但后续同步代码在微任务里执行，vm 管不到 ——
+ *   整个进程被按死，调度、HTTP、保活全停，Promise.race 的超时分支永远不触发。
+ *   现在执行体在 worker 里，主线程到点直接 terminate()，卡死/僵尸脚本一刀切断。
+ *
+ * 边界：facade 包住了所有宿主能力，拿不到 require / process / fs，
+ *   但 vm 不是安全边界（官方口径），只能定位成「防手滑」。
+ *   跑自己写的、信得过的脚本；来路不明的别贴。
+ * ============================================================
+ */
+const SCRIPT_OUTPUT_MAX = 20000;
+const SCRIPT_VM_TIMEOUT = 5000;      // 同步段闸（worker 内核里也有一份）
+const SCRIPT_TIMEOUT_MAX_SEC = 300;  // 任务级上限，与前端输入框一致
+const SCRIPT_RUNNER = path.join(__dirname, 'lib', 'script-runner.cjs');
+
+function safeScriptEnv() {
+  const out = {};
+  for (const v of (state.settings.envVars || [])) {
+    // 只给启用中的变量：applyEnvVars 也是这个口径，不然脚本能读到用户已停用的密钥
+    if (v && v.enabled !== false && v.key && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v.key)) {
+      out[v.key] = String(v.value == null ? '' : v.value);
+    }
+  }
+  return Object.freeze(out);
+}
+
+/**
+ * 在 worker 线程里跑一段脚本，到点强制终止。
+ * 返回 { text } —— text 是「日志 + 返回值」拼好的正文；失败抛 Error（带 logs）。
+ */
+function runScriptInWorker({ code, env, timeoutMs, name }) {
+  return new Promise((resolve, reject) => {
+    let worker;
+    try {
+      worker = new Worker(SCRIPT_RUNNER, {
+        workerData: {
+          code,
+          env,
+          guardPrivate: privateUrlGuardOn(),
+          outputMax: SCRIPT_OUTPUT_MAX,
+          stepName: name || '',
+          fetchTimeoutMs: Math.min(timeoutMs, 30000),
+          syncTimeoutMs: SCRIPT_VM_TIMEOUT,
+        },
+        // 脚本乱开数组不至于把整台机器吃光；超了 worker 自己 OOM 退出，主进程不受影响
+        resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 32 },
+        stdout: true,
+        stderr: true,
+      });
+    } catch (e) {
+      reject(new Error('无法启动脚本线程：' + ((e && e.message) || e)));
+      return;
+    }
+
+    let settled = false;
+    let logs = '';
+    let logChars = 0;
+    const timer = setTimeout(() => {
+      finish(reject, withLogs(new Error(`脚本执行超过 ${Math.round(timeoutMs / 1000)} 秒，已强制终止`)));
+    }, timeoutMs + 750);
+
+    function withLogs(err) {
+      if (logs) err.responseBody = clipBody(logs);
+      return err;
+    }
+    function finish(fn, value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { worker.terminate(); } catch { /* 已经退了 */ }
+      fn(value);
+    }
+
+    worker.on('message', (m) => {
+      if (!m || typeof m !== 'object') return;
+      if (m.type === 'log') {
+        if (logChars >= SCRIPT_OUTPUT_MAX) return;
+        const s = String(m.line);
+        const room = SCRIPT_OUTPUT_MAX - logChars;
+        logs += (logs ? '\n' : '') + (s.length > room ? s.slice(0, room) : s);
+        logChars += Math.min(s.length, room);
+        return;
+      }
+      if (m.type === 'done') {
+        finish(resolve, { text: String(m.text || ''), ms: Number(m.ms) || 0 });
+        return;
+      }
+      if (m.type === 'fail') {
+        finish(reject, withLogs(new Error(String(m.message || '脚本执行失败').slice(0, 300))));
+      }
+    });
+    worker.on('error', (e) => {
+      const oom = e && e.code === 'ERR_WORKER_OUT_OF_MEMORY';
+      finish(reject, withLogs(new Error(oom ? '脚本占用内存超过 128MB，已终止' : String((e && e.message) || e).slice(0, 300))));
+    });
+    worker.on('exit', (codeNum) => {
+      if (settled) return;
+      finish(reject, withLogs(new Error(codeNum === 0 ? '脚本线程提前退出（无结果）' : `脚本线程异常退出（code ${codeNum}）`)));
+    });
+  });
+}
+
+async function runScriptTask(task, cfg) {
+  const code = String(cfg.script || '');
+  if (!code.trim()) throw new Error('脚本内容为空');
+  const t0 = Date.now();
+  // 脚本默认给 60 秒：一次 HTTP + 几段处理通常够，超过说明脚本写错了
+  const timeoutMs = Math.max(3, Math.min(SCRIPT_TIMEOUT_MAX_SEC, Number(cfg.timeoutSec) || 60)) * 1000;
+  let out;
+  try {
+    out = await runScriptInWorker({
+      code,
+      env: safeScriptEnv(),
+      timeoutMs,
+      name: cfg.name || task.name || '',
+    });
+  } catch (err) {
+    const e = new Error(`脚本执行失败：${String((err && err.message) || err).slice(0, 300)}`);
+    if (err && err.responseBody) e.responseBody = err.responseBody;
+    // 供 isTransientFailure 识别：脚本失败不自动重试（副作用已发生）
+    e.scriptFailure = true;
+    // 失败时把最后几行日志带进 message：手机上点开通知就能看出卡在哪一行
+    const tail = String((err && err.responseBody) || '').trim().split('\n').slice(-5).join('\n');
+    if (tail) e.message += `\n${tail.slice(0, 300)}`;
+    throw e;
+  }
+  const body = clipBody(String(out.text || '').slice(0, SCRIPT_OUTPUT_MAX));
+  const ms = Date.now() - t0;
+  return {
+    ok: true,
+    status: 200,
+    soft: false,
+    ms,
+    message: `脚本执行成功，耗时 ${ms}ms。输出：${body || '(无输出)'}`,
+    json: tryParseJSON(body),
+    text: body,
+    response: body,
+    stepName: cfg.name || '',
+    scriptOutput: true, // 通知层据此把脚本输出当正文，而不是退化成「HTTP 200，耗时」
+  };
+}
+
+async function runHttpTask(task, rt) {
   const cfg = task.config || {};
+  // rt.vars：多步骤任务里前面步骤提取出的运行期变量（{{step1.token}}）
+  const vars = (rt && rt.vars) || null;
+  // 配了 script 就走脚本分支，url 可以留空（脚本任务不需要请求地址）
+  if (cfg.script && String(cfg.script).trim()) {
+    return runScriptTask(task, cfg);
+  }
   if (!cfg.url) throw new Error('未填写请求地址');
   assertUrlAllowed(cfg.url, task.name);
   const method = (cfg.method || 'GET').toUpperCase();
   // 环境变量先替换（{{KEY}} → 值），再处理凭据占位符
-  const url = applyEnvVars(cfg.url);
+  const url = applyEnvVars(cfg.url, vars);
   let headers = {};
   // 先解析占位符再 JSON.parse —— 占位符本身是合法 JSON 字符串内容
-  const headersRaw = applyTokenPlaceholder(applyEnvVars(cfg.headers));
+  const headersRaw = applyTokenPlaceholder(applyEnvVars(cfg.headers, vars));
   if (headersRaw && headersRaw.trim()) {
     try {
       headers = JSON.parse(headersRaw);
@@ -4413,8 +4993,36 @@ async function runHttpTask(task) {
   if (String(headersRaw || '').includes(TOKEN_PLACEHOLDER)) {
     throw new Error('请求头里的 {{ACCESS_TOKEN}} 未替换：请先在设置里配置凭据续期（refreshToken）');
   }
+  /*
+   * HTTP 头只允许 latin1。中文（或没替换掉的 {{取令牌.token}}）发到 Node 底层会被
+   * 直接拒绝，报「Invalid character in header content ["x-token"]」—— 看不懂，也
+   * 指不出是哪个变量惹的。这里提前拦下并说清怎么改。
+   */
+  for (const [k, v] of Object.entries(headers)) {
+    if (/[^\x20-\x7e\xa0-\xff]/.test(String(v))) {
+      throw new Error(`请求头 ${k} 含中文或全角字符（值：${String(v).slice(0, 40)}）。HTTP 头只能是 ASCII：把这段放进请求体，或先做 URL 编码；变量没替换时也会走到这里`);
+    }
+  }
   const init = { method, headers, signal: AbortSignal.timeout(Math.max(3, Number(cfg.timeoutSec) || 15) * 1000) };
-  if (method !== 'GET' && method !== 'HEAD' && cfg.body) init.body = applyEnvVars(cfg.body);
+  if (method !== 'GET' && method !== 'HEAD' && cfg.body) {
+    init.body = applyEnvVars(cfg.body, vars);
+    /*
+     * 请求体是 JSON 时，变量值里的引号 / 换行会把 JSON 打坏，而且上游只会回一句
+     * 「参数错误」，看不出是自己的密码里有引号。这里在本地先判一次：
+     * 原文（带 {{...}} 占位符）是合法 JSON、替换后不是 → 一定是变量内容的问题。
+     * 用的是确定性判据，不猜；真正的非法 JSON 仍交给上游报。
+     */
+    const ctKey = Object.keys(headers).find((k) => k.toLowerCase() === 'content-type');
+    const looksJson = /json/i.test(String((ctKey && headers[ctKey]) || '')) || /^[[{]/.test(String(cfg.body).trim());
+    if (looksJson && tryParseJSON(cfg.body)) {
+      const replaced = String(init.body).trim();
+      try {
+        JSON.parse(replaced);
+      } catch {
+        throw new Error('请求体替换变量后不是合法 JSON：变量值里可能含引号或换行，JSON 里请改用 {{json:KEY}} 让值自动转义');
+      }
+    }
+  }
 
   const t0 = Date.now();
   let res;
@@ -4515,7 +5123,14 @@ function stepsOf(task) {
    * 以前用 s.url 过滤，会把「只覆盖 headers/body、url 继承」的步骤整个丢掉；
    * 全部步骤都留空 url 时甚至静默回落成单请求任务，多步骤配置凭空消失。
    */
-  const raw = Array.isArray(cfg.steps) ? cfg.steps.filter((s) => s && (s.url || cfg.url)) : [];
+  /*
+   * 脚本步骤可以没有 url（青龙式脚本自带请求），过滤时必须一起放行 ——
+   * 以前只认 s.url，多步骤里的脚本步骤被静默丢掉，整条任务退化成单请求/直接报
+   * 「未填写请求地址」，配置看着还在、跑起来根本不是它。
+   */
+  const raw = Array.isArray(cfg.steps)
+    ? cfg.steps.filter((s) => s && (s.url || cfg.url || String(s.script || '').trim()))
+    : [];
   if (!raw.length) return [{ ...cfg, name: cfg.name || '' }];
   /*
    * 空字符串要当成「没填」，不能当成「就是空」。
@@ -4528,8 +5143,19 @@ function stepsOf(task) {
   const INHERIT_IF_EMPTY = new Set(['url', 'method', 'headers', 'body', 'expectStatus', 'alsoOkStatus', 'timeoutSec']);
   return raw.map((s, i) => {
     const merged = { ...cfg };
+    // 脚本按步骤归属：任务级 script 只服务「单脚本任务」，不要复制到每个 HTTP 步骤上重复执行
+    if (!String(s.script || '').trim()) delete merged.script;
     for (const [k, v] of Object.entries(s)) {
       if (INHERIT_IF_EMPTY.has(k) && (v === '' || v === null || v === undefined)) continue;
+      /*
+       * 步骤级 extract 不能直接覆盖任务级：任务级那条是「通知里要显示什么」，
+       * 步骤级那条是「把什么值传给后面的步骤」。同名键直接覆盖会让任务级声明
+       * 凭空消失（通知退回 HTTP 200），所以单独放 stepExtract，运行期再合并。
+       */
+      if (k === 'extract') {
+        if (Array.isArray(v) && v.length) merged.stepExtract = v;
+        continue;
+      }
       merged[k] = v;
     }
     merged.name = s.name || merged.name || `第 ${i + 1} 步`;
@@ -4547,14 +5173,43 @@ function stepsOf(task) {
 async function runHttpSteps(task) {
   const steps = stepsOf(task);
   const collected = [];
+  /*
+   * 步骤间传值：前一步提取到的字段，后一步用 {{step1.token}} / {{取令牌.token}} 引用。
+   * 以前多步骤只能各自独立，登录拿 token 再带着它请求这种最常见的两段式根本写不出来 ——
+   * 用户只能退回脚本任务，或者把 token 手抄进配置（几小时就过期）。
+   * 不传进全局环境变量：那是用户资产，运行期值只活这一次执行。
+   */
+  const vars = {};
+  const fieldsOf = (step) => {
+    const own = Array.isArray(step.stepExtract) ? step.stepExtract : [];
+    const shared = Array.isArray(task.config && task.config.extract) ? task.config.extract : [];
+    if (!own.length) return shared;
+    // 步骤级优先，任务级补它没有的（按 label+path 判重）
+    return own.concat(shared.filter((f) => !own.some((x) => x.label === f.label && x.path === f.path)));
+  };
+  const harvest = (step, r, idx) => {
+    const fields = fieldsOf(step);
+    if (!fields.length || !r || r.ok === false) return;
+    const ext = extractFromStep(r, fields);
+    if (!Object.keys(ext).length) return;
+    // 通知层优先用这一步真正的提取结果（任务级声明可能对不上这一步的字段）
+    r.extract = ext;
+    for (const [k, v] of Object.entries(ext)) {
+      vars[`step${idx + 1}.${k}`] = v;
+      if (step.name) vars[`${step.name}.${k}`] = v;
+    }
+  };
   if (steps.length === 1) {
     /*
      * 必须传合并后的 step：stepsOf 已算好「步骤级覆盖 + 任务级继承」。
      * 以前直接传原 task，用户为单个步骤单独配的 url / method / headers / body
      * 会被静默忽略，实际跑的是任务级配置，现象与「老单请求任务」一模一样，极难排查。
      */
-    const r = await runHttpTask({ ...task, config: steps[0] });
-    collected.push({ name: steps[0].name || r.stepName || task.name, ...r });
+    const r = await runHttpTask({ ...task, config: steps[0] }, { vars });
+    // 步骤标记要带出去：关键步骤（critical）失败时，即使这一步是 optional，
+    // 整体也必须算失败 —— optional 只负责「别中断后面的步骤」，不负责「假装没失败」。
+    collected.push({ name: steps[0].name || r.stepName || task.name, critical: steps[0].critical === true, ...r });
+    harvest(steps[0], collected[0], 0);
     return { message: r.message, steps: collected };
   }
 
@@ -4563,15 +5218,18 @@ async function runHttpSteps(task) {
   // 上游到底说了什么（余额不足 / 令牌过期）全丢了。
   let failBody = '';
   let failStatus = null;
-  for (const step of steps) {
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
     const label = step.name;
     try {
-      const r = await runHttpTask({ ...task, config: step });
-      collected.push({ name: label, ...r });
+      const r = await runHttpTask({ ...task, config: step }, { vars });
+      collected.push({ name: label, critical: step.critical === true, ...r });
+      harvest(step, collected[collected.length - 1], i);
       parts.push(`[${label}] 成功：${r.message}`);
     } catch (err) {
       collected.push({
         name: label,
+        critical: step.critical === true,
         ok: false,
         error: err.message,
         json: null,
@@ -4587,6 +5245,14 @@ async function runHttpSteps(task) {
         const e = new Error(parts.join(' ｜ '));
         if (failBody) e.responseBody = failBody;
         if (failStatus != null) e.httpStatus = failStatus;
+        if (err && err.scriptFailure) e.scriptFailure = true;
+        /*
+         * 前面已经有步骤成功过 → 整个任务不能自动重试。
+         * 重试是从第一步重新跑，签到成功、领奖 500 的场景会变成「签到两次」：
+         * 上游多半回「今日已签到」，用户收到的告警却是签到失败 —— 比不重试更糟。
+         * 这类重放风险交给 runTask 判定（见 sideEffectRisk）。
+         */
+        if (collected.some((s) => s && s.ok !== false)) e.sideEffectRisk = true;
         // 带上已经跑完的步骤：配置测试要在失败时也能逐条显示「哪一步过了、哪一步挂了」。
         // 正常执行路径不读这个字段，纯粹是给测试接口多开一扇门，不改变任何既有行为。
         e.steps = collected;
@@ -4614,7 +5280,16 @@ async function runHttpSteps(task) {
 /** 按 "data.streak_days" 这样的点号路径取值；取不到返回 undefined。 */
 function pickPath(obj, path) {
   if (!obj || !path) return undefined;
-  return String(path).split('.').reduce((acc, k) => {
+  /*
+   * 两种写法都要认：data.list.0.token 与 data.list[0].token。
+   * 接口文档给的多半是后者，直接粘过来以前会取不到 —— 不报错，只是通知里
+   * 少一行业务字段、退回「HTTP 200」，看着像任务没数据，实际是路径没解析。
+   * 方括号里的引号可省略；key 本身含点时方括号写法是唯一能表达的方式。
+   */
+  const norm = String(path)
+    .replace(/\[\s*(?:"([^"]*)"|'([^']*)'|([^\]]*))\s*\]/g, (m, d, s, raw) => '.' + (d != null ? d : s != null ? s : String(raw).trim()))
+    .replace(/^\.+/, '');
+  return norm.split('.').reduce((acc, k) => {
     if (acc == null) return undefined;
     if (Array.isArray(acc) && /^\d+$/.test(k)) return acc[Number(k)];
     return acc[k];
@@ -4748,23 +5423,41 @@ function qwSpan(start, end) {
  * 拼好，模型原样抄，不做换算、不加「起」「停」。
  */
 
+/* 和风给英文方位码 + 蒲福风级，直接交给模型会被写成「ne1级」。翻成中文再出。
+ * 方位并到 8 向：`sse` 逐字翻出来是「南东南」，中文播报里没人这么说，只留「东南」。 */
+const QW_DIR = {
+  n: '北', nne: '北', ne: '东北', ene: '东北', e: '东', ese: '东', se: '东南', sse: '东南',
+  s: '南', ssw: '南', sw: '西南', wsw: '西南', w: '西', wnw: '西', nw: '西北', nnw: '西北',
+};
+function qwWind(w) {
+  if (!w || w.scale == null) return '';
+  const s = Number(w.scale);
+  if (!Number.isFinite(s)) return '';
+  if (s === 0) return '静风';
+  const d = QW_DIR[(w.direction && w.direction.compass) || ''] || '';
+  return d ? `${d}风${s}级` : `${s}级`;
+}
+
+/*
+ * 通知正文里的风只回答一个问题：出门要不要当心风。
+ * 「东北风5级」既占 5 个字又得自己换算，换成 无风 / 微风 / 大风 三档，
+ * 两字说完，5 级起算大风（旗帜翻展、走路顶风）。材料的实况行仍用 qwWind。
+ */
+function qwWindBrief(w) {
+  if (!w || w.scale == null) return '';
+  const s = Number(w.scale);
+  if (!Number.isFinite(s)) return '';
+  if (s <= 0) return '无风';
+  return s >= 5 ? '大风' : '微风';
+}
+
 function summarizeQWeatherStep(j) {
   const lines = [];
   const n1 = (v, unit = '') => (v == null || v === '' ? '' : `${Math.round(Number(v) * 10) / 10}${unit}`);
   const pct = (v) => (v == null ? '' : `${Math.round(Number(v) * 100)}%`);
   const cond = (c) => (c && c.text ? c.text : '');
-  const DIR = {
-    n: '北', nne: '北东北', ne: '东北', ene: '东东北', e: '东', ese: '东东南', se: '东南', sse: '南东南',
-    s: '南', ssw: '南西南', sw: '西南', wsw: '西西南', w: '西', wnw: '西西北', nw: '西北', nnw: '北西北', vrb: '不定',
-  };
-  // 和风给的是英文方位码 + 蒲福风级，直接扔给模型会写成「ne1级」，先翻成中文
-  const wind = (w) => {
-    if (!w || w.scale == null) return '';
-    const s = Number(w.scale);
-    if (s === 0) return '静风';
-    const d = DIR[(w.direction && w.direction.compass) || ''] || '';
-    return `${d}${s}级`;
-  };
+  // 风向风级统一走 qwWind，实况 / 逐日 / 事实结论三处用同一套翻译
+  const wind = qwWind;
 
   // 单个时间点的天气（实况与逐小时共用同一套字段名）
   const point = (o) => {
@@ -4960,7 +5653,22 @@ function qWeatherFacts(steps) {
 
   const lines = ['【事实结论｜优先直接引用，禁止自行扫描或推算】'];
   lines.push(`今晚 日期=${d0date} 现象=${cond(tonight)} 最低=${n1(tonight.temperatureMin && tonight.temperatureMin.value, '°C')} 昼夜=${spanOf(tonight)} 降水=${rowTonight.band || '无'}`);
-  lines.push(`明天 日期=${d1date} 现象=${cond(tmrPart)} 最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')} 最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')} 昼夜=${spanOf(tmrPart)} 降水=${rowTomorrow.band || '无'}`);
+  /*
+   * 明天行带风力：白天出门要不要加件外套，风比温度更直观。
+   * 今天这行回退到明天夜间时（白天没降水、夜里才有），风力也跟着取夜间那份，
+   * 免得「明天19-07时小雪」旁边配一个白天的风。取不到就不写这个字段。
+   */
+  const tmrWind = qwWindBrief(tmrPart.wind) || qwWindBrief(tomorrow.wind);
+  const tmrBits = [
+    `明天 日期=${d1date}`,
+    `现象=${cond(tmrPart)}`,
+    `最低=${n1(d1.temperatureMin && d1.temperatureMin.value, '°C')}`,
+    `最高=${n1(d1.temperatureMax && d1.temperatureMax.value, '°C')}`,
+    `昼夜=${spanOf(tmrPart)}`,
+    `降水=${rowTomorrow.band || '无'}`,
+  ];
+  if (tmrWind) tmrBits.push(`风力=${tmrWind}`);
+  lines.push(tmrBits.join(' '));
   // 时段就给这一串，模型原样拼在现象前面：`19-07时`。不给「今晚19时／明早7时」
   // 这种还得再加工的原子 —— 每加工一次，就多一次改编的机会。
   lines.push(`降水区间=${band || '无'} 来源=${bandSrc || '无降水'} 类型=${bandText || '无'}`);
@@ -5067,6 +5775,29 @@ function summarizeStepData(steps, cap) {
   return limit > 0 && text.length > limit ? text.slice(0, limit) + '\n…（数据已截断）' : text;
 }
 
+/*
+ * 透传正文的字节闸。
+ *
+ * noticeRaw / 脚本输出都是「原样作正文」，不压 160 字 —— 但 FCM 单条 4096 字节，
+ * 超了服务端直接 400「Message is too large」，整条通知发不出去（2026-11-21 实测：
+ * 1247 字正文被拒，675 字通过）。中文 3 字节/字，3600 字节留 400 给标题与 JSON 包装。
+ * 只在「确实超了」时截，短正文一个字节都不动。
+ */
+const NOTICE_BODY_MAX_BYTES = 3600;
+function clipNoticeBytes(str, maxBytes = NOTICE_BODY_MAX_BYTES) {
+  const s = String(str == null ? '' : str);
+  if (!s || Buffer.byteLength(s, 'utf8') <= maxBytes) return s;
+  let out = '';
+  let used = 0;
+  for (const ch of s) {
+    const b = Buffer.byteLength(ch, 'utf8');
+    if (used + b > maxBytes - 3) break;
+    out += ch;
+    used += b;
+  }
+  return out + '…';
+}
+
 /**
  * 生成推送内容：通知栏一句话 + 详情页 markdown。
  * 返回 { title, body, markdown }。
@@ -5074,6 +5805,43 @@ function summarizeStepData(steps, cap) {
 function buildRunNotice(task, { ok, message, duration, stepResults, trigger }) {
   const fields = (task.config && Array.isArray(task.config.extract)) ? task.config.extract : null;
   const title = (ok ? '✅ ' : '❌ ') + task.name;
+
+  /*
+   * 正文透传（noticeRaw）：服务端已把通知正文算好（如周报），按点号路径从成功步骤的
+   * JSON 里取该字段，原样推送 —— 不压成 160 字摘要、不 join(' · ')、不改换行。
+   * 这类任务必须配 aiEnabled:false，否则 AI 会把算好的数字重写一遍（有编造风险）。
+   */
+  const rawPath = task.config && task.config.noticeRaw;
+  if (rawPath && ok) {
+    for (const s of (stepResults || [])) {
+      if (!s || s.ok === false) continue;
+      const v = pickPath(s.json, rawPath);
+      if (v != null && String(v).trim()) {
+        const full = clipNoticeBytes(clipBody(String(v)));
+        return { title: '📊 ' + task.name, body: full, markdown: `## ${task.name}\n\n${full}` };
+      }
+    }
+  }
+
+  /*
+   * 脚本步骤：输出就是通知正文（青龙式脚本自己排版），不退化成「HTTP 200，耗时」，
+   * 也不压成 160 字摘要。多个脚本步骤时用换行拼接。
+   */
+  const scriptOuts = (stepResults || []).filter((s) => s && s.ok !== false && s.scriptOutput && String(s.text || '').trim());
+  if (scriptOuts.length) {
+    const full = clipNoticeBytes(clipBody(scriptOuts.map((s) => String(s.text).trim()).join('\n')));
+    // 脚本自己排版好了正文，但整体仍可能失败（后面的步骤挂了 / 关键步骤挂了）——
+    // 这里过去无条件回 ✅，手机上看到「成功」点进去却是失败，所以按 ok 出标题并附失败步骤
+    const bad = (stepResults || []).filter((s) => s && s.ok === false);
+    const note = bad.length
+      ? '\n\n' + bad.map((s) => `❌ ${s.name || '步骤'}：${String(s.error || '').slice(0, 120)}`).join('\n')
+      : '';
+    return {
+      title: (ok ? '✅ ' : '❌ ') + task.name,
+      body: full + note,
+      markdown: `## ${task.name}\n\n${full}${note}`,
+    };
+  }
 
   // 逐步骤收集事实
   const lines = [];
@@ -5084,7 +5852,8 @@ function buildRunNotice(task, { ok, message, duration, stepResults, trigger }) {
       lines.push(`- ❌ **${s.name}**：${String(s.error || '').slice(0, 120)}`);
       continue;
     }
-    const ext = fields ? extractFromStep(s, fields) : {};
+    // 执行期已经按「这一步自己的声明」提取过，优先用它；没有才退回任务级字段再算一次
+    const ext = (s.extract && Object.keys(s.extract).length) ? s.extract : (fields ? extractFromStep(s, fields) : {});
     const bits = [];
     if (Object.keys(ext).length) {
       for (const [k, v] of Object.entries(ext)) bits.push(`${k} ${v}`);
@@ -5157,6 +5926,12 @@ function retryPolicyOf(task) {
 }
 
 function isTransientFailure(err) {
+  /*
+   * 脚本失败一律不重试。脚本没有状态码，按「无状态码 = 连接层失败」会被当成可重试，
+   * 但脚本已经执行过一遍（签到、领奖、下单都可能已经生效），重试就是第二次副作用。
+   * 脚本内部的网络抖动让脚本自己重试，比调度器盲重可靠。
+   */
+  if (err && err.scriptFailure) return false;
   const st = err && err.httpStatus;
   if (st == null || st === '') return true; // 无状态码 = 连接层失败
   const n = Number(st);
@@ -5164,7 +5939,46 @@ function isTransientFailure(err) {
   return n >= 500 || n === 408 || n === 429;
 }
 
+/*
+ * 任务依赖：前置任务在指定窗口内成功执行过，本任务才跑。
+ * 典型是「猫猫到达领奖」依赖 09:10 的签到派出成功 —— 没派出去，14:00 去领只会拿到
+ * 403，白跑一次还制造一条失败告警。手动执行跳过依赖（人主动点的，就是要跑）。
+ * 不满足时返回跳过原因，不写失败日志、不动 failCount、不触发重试。
+ */
+function dependencyBlock(task, trigger) {
+  const dep = task && task.config && task.config.dependsOn;
+  if (!dep || !dep.taskId || trigger === 'manual') return null;
+  const pre = (state.tasks || []).find((t) => t.id === dep.taskId);
+  if (!pre) return `前置任务不存在（${dep.taskId}）`;
+  const hours = Math.max(1, Math.min(72, Number(dep.withinHours) || 24));
+  const lastAt = lastRunAtOf(pre);
+  if (!lastAt || Date.now() - lastAt > hours * 3600 * 1000) {
+    return `前置任务「${pre.name}」最近 ${hours} 小时内没跑过`;
+  }
+  if (pre.lastResult && pre.lastResult.ok === false) {
+    return `前置任务「${pre.name}」上次执行失败`;
+  }
+  return null;
+}
+
 async function runTask(task, trigger) {
+  // 依赖不满足：留痕但不跑。nextRun 由调度器在触发前已推进，这里不重算。
+  const blocked = dependencyBlock(task, trigger);
+  if (blocked) {
+    const at = nowISO();
+    pushSysLog({
+      level: 'info', source: 'scheduler',
+      msg: `跳过「${task.name}」：${blocked}`,
+      detail: { taskId: task.id, taskName: task.name, reason: blocked, dependsOn: task.config.dependsOn },
+    });
+    state.logs.unshift({ id: uid('log'), taskId: task.id, taskName: task.name, ok: true,
+      message: '依赖未满足，已跳过：' + blocked, duration: 0, trigger, at, skipped: true });
+    if (state.logs.length > MAX_LOGS) state.logs.length = MAX_LOGS;
+    // 跳过也归档一条，周报里能看出「这几天都没满足依赖」
+    recordArchive(task, { at, ok: true, trigger, duration: 0, message: blocked, body: '⏭ 依赖未满足，未执行', steps: [] });
+    flushState();
+    return { ok: true, skipped: true, message: blocked, duration: 0 };
+  }
   const startedAt = Date.now();
   /*
    * 运行中标记：进程如果在这一句和结尾之间被回收，重启后 state.json 里会留下 runningAt，
@@ -5195,6 +6009,21 @@ async function runTask(task, trigger) {
           message = rr.message;
           stepResults = rr.steps || [];
           responseBody = joinStepBodies(stepResults);
+          /*
+           * 关键步骤失败：optional 让流程继续跑完（领奖/派出不该被签到失败挡住），
+           * 但整体必须记失败并触发 failCount 与告警 —— 签到任务最重要，
+           * 失败被吞成「成功」比直接失败危险得多。
+           */
+          const criticalBad = stepResults.filter((s) => s && s.critical && s.ok === false);
+          if (criticalBad.length) {
+            const e = new Error(`关键步骤失败：${criticalBad.map((s) => s.name).join('、')}｜${message}`);
+            e.steps = stepResults;
+            e.responseBody = responseBody;
+            e.noRetry = true;
+            // 关键步骤失败一律不重试：签到类上游重试就是重复签到，
+            // 宁可记一次失败让告警和人工介入接手（isTransientFailure 也拦不住这里）
+            throw e;
+          }
           if (attempts > 1) {
             /*
              * 重试成功必须留下痕迹：结果看着是「成功」，但上游第一次确实挂了，
@@ -5211,7 +6040,21 @@ async function runTask(task, trigger) {
           }
           break;
         } catch (err) {
-          const canRetry = attempts <= policy.times && isTransientFailure(err);
+          /*
+           * 已有步骤成功过就不重试（sideEffectRisk）：重试是从第一步重跑，
+           * 「签到成功 → 领奖 500」重试一次就是第二次签到，用户收到的还是失败告警。
+           * 这类任务让人工介入，或把领奖拆成独立任务（它自己能安全重试）。
+           */
+          if (err && err.sideEffectRisk && attempts <= policy.times) {
+            pushSysLog({
+              level: 'warn',
+              source: 'task',
+              msg: `任务「${task.name}」前序步骤已成功，跳过自动重试以免重复执行`,
+              detail: { taskId: task.id, taskName: task.name, attempts },
+            });
+            err.noRetry = true;
+          }
+          const canRetry = !err.noRetry && attempts <= policy.times && isTransientFailure(err);
           if (!canRetry) throw err;
           // 线性退避：第 n 次失败等 n×间隔。总等待有上限（3×30s），不会把调度卡死。
           const wait = policy.delayMs * attempts;
@@ -5473,8 +6316,8 @@ async function runTask(task, trigger) {
         });
       } else if (polished) {
         /*
-         * 标题固定用任务名。AI 曾把「24 h天气三甲集」改写成
-         * 「甘肃广河三甲集 24h 天气播报」，又长又不在任务列表里，
+         * 标题固定用任务名。AI 曾把「24 h天气示例镇」改写成
+         * 「某市示例镇 24h 天气播报」，又长又不在任务列表里，
          * 用户按任务名找不到对应通知。AI 只负责正文，不碰标题。
          */
         // 留一份 AI 之前的原文：通知详情里能直接切换比对「到底改了什么」，
@@ -5676,6 +6519,16 @@ async function runTask(task, trigger) {
   } else if (task.type === 'http') {
     console.log(`[notify] 「${task.name}」${ok ? '成功' : '失败'}，未勾选该时机的通知或总开关关闭，跳过`);
   }
+  /*
+   * 归档独立于通知：就算这个任务关了完成通知，数据也要留着做周报。
+   * 正文优先取 AI 改写后的播报（用户真正读的那句），没有就用 message。
+   */
+  recordArchive(task, {
+    at, ok, trigger, duration,
+    message,
+    body: (notice && notice.body) || message,
+    steps: stepResults,
+  });
   /*
    * ★ 第二段提交：推送结果 + 站内记录落盘。
    * 执行结果在上面的第一段已经写过盘了，这里补的是「通知发了没、走了哪些渠道」。
@@ -5992,9 +6845,28 @@ function catchupSnapshot() {
  * 所以加两个兜底：看门狗强制解锁 + 单任务总时长上限。
  */
 const TICK_STUCK_MS = 5 * 60 * 1000;
-/** 单任务总时长上限：3 步 × 15s 超时 × 3 次重试已经 135s，留一点余量。 */
+/** 单任务总时长下限：3 步 × 15s 超时 × 3 次重试已经 135s，留一点余量。 */
 const TASK_DEADLINE_MS = 150 * 1000;
+/*
+ * 但单步超时上限是 300 秒 —— 总闸固定 150 秒就等于「单次超时填超过 120 秒没有任何用」：
+ * 任务在 150 秒被判「总时长超过」并告警，那段脚本其实还在后台跑，最后自己跑完。
+ * 现在按任务自己的超时放宽，上限 330 秒：调度锁在这段时间是占着的，再长会撞上
+ * tickWatchdog 的 5 分钟强制释放，变成两批任务并发执行。
+ */
+const TASK_DEADLINE_MAX_MS = 330 * 1000;
+
+function taskDeadlineMs(task) {
+  const c = (task && task.config) || {};
+  let maxSec = Number(c.timeoutSec) || 15;
+  for (const s of (Array.isArray(c.steps) ? c.steps : [])) {
+    const t = Number(s && s.timeoutSec) || 0;
+    if (t > maxSec) maxSec = t;
+  }
+  return Math.min(TASK_DEADLINE_MAX_MS, Math.max(TASK_DEADLINE_MS, (maxSec + 30) * 1000));
+}
 let tickStartedAt = 0;
+/** 最近一次扫描完成时刻：ticking 只在扫描途中为 true，页面拿它判「运行中」会常年误报卡住。 */
+let lastTickAt = 0;
 let tickStuckCount = 0;
 let tickStuckAlertAt = 0;
 
@@ -6033,8 +6905,9 @@ function tickWatchdog() {
  */
 async function runTaskGuarded(task, trigger) {
   let timer = null;
+  const limit = taskDeadlineMs(task);
   const deadline = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error('任务总时长超过 ' + Math.round(TASK_DEADLINE_MS / 1000) + ' 秒，已放行调度')), TASK_DEADLINE_MS);
+    timer = setTimeout(() => reject(new Error('任务总时长超过 ' + Math.round(limit / 1000) + ' 秒，已放行调度')), limit);
     if (timer && timer.unref) timer.unref();
   });
   try {
@@ -6216,6 +7089,7 @@ async function tick() {
   } finally {
     ticking = false;
     tickStartedAt = 0;
+    lastTickAt = Date.now();
   }
   return ranCount;
 }
@@ -6520,6 +7394,46 @@ function readBody(req) {
   });
 }
 
+/* ---- 只读 Open API：第三方 token 校验与限流 ---- */
+const openApiHits = new Map(); // tokenHash -> { n, resetAt }，每分钟窗口，纯内存
+
+function openApiTokenHash(token) {
+  return crypto.createHash('sha256').update('cronhub-openapi|v1|' + String(token)).digest('hex');
+}
+function openApiAuthed(req, url) {
+  const urlToken = url && url.searchParams ? url.searchParams.get('token') : '';
+  const oa = state.settings.openApi || {};
+  if (!oa.enabled || !oa.tokenHash) return false;
+  const h = req.headers.authorization || '';
+  // 兼容三种传法：标准 Bearer、X-Open-Token 头、query token。
+  // 注意：WorkBuddy 托管网关会改写自定义 header/query，若读到的是网关注入串（长度异常），
+  // 视为「未提供有效 token」，不要拿它硬比对 —— 否则日志里全是误导性的 mismatch。
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  // 顺序很关键：托管网关会往 authorization/x-open-token 注入它自己的 379 字串，
+  // 而 ?token= 与 ?sharecode= 走同一条 query 通道、能可靠透传，所以 query 优先。
+  let candidate = String(urlToken || req.headers['x-open-token'] || (m && m[1]) || '').trim();
+  if (!candidate || candidate.length > 200) return false;
+  const got = Buffer.from(openApiTokenHash(candidate));
+  const want = Buffer.from(oa.tokenHash);
+  if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return false;
+  // 限流：每个 token 每分钟 60 次
+  const key = oa.tokenHash.slice(0, 16);
+  const now = Date.now();
+  let rec = openApiHits.get(key);
+  if (!rec || now >= rec.resetAt) { rec = { n: 0, resetAt: now + 60000 }; openApiHits.set(key, rec); }
+  rec.n += 1;
+  return rec.n <= 60;
+}
+// 只输出与任务执行相关、且已脱敏的字段，绝不外发 settings 全文/通知/日志正文里的敏感信息
+function openApiTasks() {
+  return state.tasks.map((t) => ({
+    id: t.id, name: t.name, type: t.type, enabled: t.enabled,
+    group: t.group || '', schedules: taskSchedules(t),
+    nextRun: t.nextRun || null, lastRun: t.lastRun || null,
+    lastResult: t.lastResult ? { ok: t.lastResult.ok, at: t.lastResult.at, message: String(t.lastResult.message || '').slice(0, 200) } : null,
+  }));
+}
+
 function publicState(role) {
   const asAdmin = role === 'admin';
   // 只读：唤醒令牌在启动阶段由 ensureWakeToken() 一次性备好。
@@ -6538,6 +7452,8 @@ function publicState(role) {
     }),
     notifications: state.notifications,
     logs: state.logs,
+    // 归档周报摘要（7 天）：任务列表入口与主页展示共用，明细走 /api/archive
+    archive: archiveSummary(7),
     // 统一脱敏出口：凭据类字段一律打码，要明文走 /api/settings/reveal
     settings: maskSettings(state.settings, { admin: asAdmin }),
     // 中继健康快照：中继是唯一短信出口，前端据此在设置页直接暴露「活着 / 挂了」
@@ -6605,9 +7521,24 @@ function publicState(role) {
   };
 }
 
+/**
+ * 字段提取声明清洗：路径必填、label 可选，最多 20 条。
+ * 任务级（config.extract）用于通知正文；步骤级（step.extract）另外承担
+ * 「把值传给后续步骤」的职责（{{step1.token}}），两处语法完全一致。
+ */
+function sanitizeExtract(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((f) => f && String(f.path || '').trim())
+    .slice(0, 20)
+    .map((f) => ({ path: String(f.path).trim().slice(0, 120), label: String(f.label || '').trim().slice(0, 24) }));
+}
+
 /** 校验并规范化单条 HTTP 请求配置（也是 steps 里每一步的形状）。 */
 function sanitizeHttpStep(raw) {
   const c = raw || {};
+  const sc = String(c.script || '');
+  const hasScript = !!sc.trim();
   const step = {
     url: String(c.url || '').trim(),
     method: String(c.method || 'GET').toUpperCase(),
@@ -6616,10 +7547,22 @@ function sanitizeHttpStep(raw) {
     expectStatus: Number(c.expectStatus) || 200,
     // 额外视为成功的状态码，例如签到接口在「今天已签」时返回 400
     alsoOkStatus: parseStatusList(c.alsoOkStatus),
-    timeoutSec: Math.max(3, Number(c.timeoutSec) || 15),
+    /*
+     * 上限与前端一致：脚本最长 300 秒，HTTP 任务实际还受 330 秒总闸约束。
+     * 默认值按类型分开：HTTP 一次请求 15 秒足够；脚本要发好几个请求，
+     * 统一按 15 秒会把它砍在半路（注释以前写「脚本默认 60」，但那句永远不生效 ——
+     * 这里把 15 写死以后，runScriptTask 的 || 60 就再也轮不到）。
+     */
+    timeoutSec: Math.max(3, Math.min(300, Number(c.timeoutSec) || (hasScript ? 60 : 15))),
   };
   if (c.name) step.name = String(c.name).slice(0, 40);
   if (c.optional === true) step.optional = true;
+  // 关键步骤：失败必须让整体记失败（optional 只保证后续步骤继续跑）
+  if (c.critical === true) step.critical = true;
+  // 脚本步骤（青龙式）：配了 script 就用脚本执行，url 可留空。上限 20KB 防撑爆 state。
+  if (hasScript) step.script = sc.slice(0, 20000);
+  const ex = sanitizeExtract(c.extract);
+  if (ex.length) step.extract = ex;
   return step;
 }
 
@@ -6647,16 +7590,15 @@ function sanitizeNmPush(raw) {
   const c = raw || {};
   const base = sanitizeHttpStep(c);
   // 任务级字段提取声明（buildRunNotice 用来把响应变成可读通知）：路径必填，label 可选
-  if (Array.isArray(c.extract)) {
-    const ex = c.extract
-      .filter((f) => f && String(f.path || '').trim())
-      .slice(0, 20)
-      .map((f) => ({ path: String(f.path).trim(), label: String(f.label || '').trim().slice(0, 24) }));
-    if (ex.length) base.extract = ex;
-  }
+  const ex = sanitizeExtract(c.extract);
+  if (ex.length) base.extract = ex;
   // 通知优化：任务级模版与 AI 提示词（可选）
   const ntpl = String(c.notifyTemplate || '').trim();
   if (ntpl) base.notifyTemplate = ntpl.slice(0, 500);
+  // 正文透传字段：从成功步骤 JSON 里按此路径取全文作通知正文（如周报 text）。
+  // 用这类任务必须同时关 AI（aiEnabled:false），否则数字会被重写。
+  const nraw = String(c.noticeRaw || '').trim();
+  if (nraw) base.noticeRaw = nraw.slice(0, 60);
   const nprompt = String(c.notifyPrompt || '').trim();
   // 300 字装不下「事实规则 + 排版规则 + 风格约束」的完整提示词，保存时被硬截成
   // 半句话（线上曾停在「…把最」）；1000→1500 仍然不够，天气任务写到 1413 就把
@@ -6673,6 +7615,17 @@ function sanitizeNmPush(raw) {
    * 用于「一次都不能重复」的任务（下单、抽奖类）：宁可错过，也不重跑。
    */
   if (c.noCatchup === true) base.noCatchup = true;
+  /*
+   * 任务依赖：前置任务成功过才跑。只在本任务显式配了 taskId 时落库，
+   * 且不允许依赖自己（成了自锁，任务永远不跑）。
+   */
+  const dep = c.dependsOn;
+  if (dep && /^task_[0-9a-f]{6,20}$/.test(String(dep.taskId || ''))) {
+    base.dependsOn = {
+      taskId: String(dep.taskId),
+      withinHours: Math.max(1, Math.min(72, Number(dep.withinHours) || 24)),
+    };
+  }
   // 指定用哪个 AI 实例做优化（不填 = 用默认那套）
   const aiInst = String(c.aiInstance || '').trim();
   if (aiInst && CI_ID_RE.test(aiInst)) base.aiInstance = aiInst;
@@ -6702,7 +7655,7 @@ function sanitizeNmPush(raw) {
    */
   const hasBaseUrl = !!String(base.url || '').trim();
   const stepsRaw = Array.isArray(c.steps)
-    ? c.steps.filter((s) => s && (String(s.url || '').trim() || hasBaseUrl))
+    ? c.steps.filter((s) => s && (String(s.script || '').trim() || String(s.url || '').trim() || hasBaseUrl))
     : [];
   if (!stepsRaw.length) return base;
 
@@ -6781,9 +7734,27 @@ function sanitizeTask(input, existing) {
         };
   }
 
+  /*
+   * 任务级随机延迟（青龙 task 特性）：到点后在 [min,max] 秒内随机推迟执行。
+   * 放在 http/remind 两条分支之后统一清洗，两种任务都能配。上限 3600 秒；
+   * max<min 时抬到 min；只有显式给出有效上限才落库，老任务不凭空多字段。
+   */
+  const rdc = input.config && input.config.randomDelaySec;
+  if (rdc && (Number(rdc.min) > 0 || Number(rdc.max) > 0)) {
+    const rmin = Math.max(0, Math.min(3600, Math.round(Number(rdc.min) || 0)));
+    const rmax = Math.max(rmin, Math.min(3600, Math.round(Number(rdc.max) || 0)));
+    config.randomDelaySec = { min: rmin, max: rmax };
+  }
   // 任务级通知策略：只有前端明确传了才落库，缺省表示跟随全局（老任务行为不变）
   const notify = sanitizeNotifyPolicy(input.config && input.config.notify);
   if (notify) config.notify = notify;
+  /*
+   * 归档开关：显式关才落 false（老任务照常归档）。保留天数固定 30，
+   * 不开放配置 —— 多一个数字输入框就多一处前后端口径不一致的可能。
+   */
+  if (input.config && input.config.archive && input.config.archive.enabled === false) {
+    config.archive = { enabled: false };
+  }
   /*
    * 提醒类任务的手机推送也要能用任务级高级选项。
    * http 任务在 sanitizeHttpConfig 里已经处理过，这里只管 remind —— 两条分支
@@ -6797,8 +7768,11 @@ function sanitizeTask(input, existing) {
   }
 
   // 单请求任务必须有 url；多步骤任务则要求 steps 里每步都有 url（由 sanitizeHttpConfig 校验）
-  if (type === 'http' && !config.url && !(config.steps && config.steps.length)) {
-    throw new Error('必须填写请求地址');
+  // 脚本任务（config.script）不需要 url
+  const hasScript = !!String(config.script || '').trim()
+    || !!(config.steps || []).some((s) => s && String(s.script || '').trim());
+  if (type === 'http' && !config.url && !(config.steps && config.steps.length) && !hasScript) {
+    throw new Error('必须填写请求地址或脚本内容');
   }
   if (type === 'remind' && !config.message.trim()) throw new Error('必须填写提醒内容');
 
@@ -6827,6 +7801,53 @@ function sanitizeTask(input, existing) {
 async function handleApi(req, res, url) {
   const { pathname } = url;
   const method = req.method;
+
+  /* ---- Open API token 管理（仅管理员）：生成/轮换/关闭，明文只返回一次 ---- */
+  if (pathname === '/api/admin/openapi/token' && (method === 'POST' || method === 'DELETE')) {
+    // 与全站一致：没开密码访问时是单用户可信模式，放行；开了密码则必须管理员
+    if (REQUIRE_PASSWORD && !isAdmin(req)) return sendJSON(res, 403, { ok: false, error: '需要管理员权限' });
+    if (method === 'DELETE') {
+      state.settings.openApi = { enabled: false, tokenHash: '', createdAt: '' };
+      flushState();
+      pushSysLog({ level: 'info', source: 'openapi', msg: '只读 API Token 已关闭' });
+      return sendJSON(res, 200, { ok: true, message: '已关闭' });
+    }
+    // POST：生成新 token（覆盖旧的）。开放强度够用的随机串，前缀便于识别
+    const token = 'crh_' + crypto.randomBytes(24).toString('base64url');
+    state.settings.openApi = {
+      enabled: true,
+      tokenHash: openApiTokenHash(token),
+      createdAt: nowISO(),
+    };
+    flushState();
+    openApiHits.clear();
+    pushSysLog({ level: 'info', source: 'openapi', msg: '只读 API Token 已生成', detail: { createdAt: state.settings.openApi.createdAt } });
+    return sendJSON(res, 200, { ok: true, token, message: '请立即保存，此明文只显示一次' });
+  }
+
+  /* ---- 只读 Open API：Bearer token 鉴权，绝不开放任何写操作 ---- */
+  if (pathname.startsWith('/api/open/')) {
+    if (!openApiAuthed(req, url)) {
+      return sendJSON(res, 401, { ok: false, error: '无效或缺失的只读 API Token' });
+    }
+    if (method !== 'GET') {
+      return sendJSON(res, 405, { ok: false, error: 'Open API 仅支持 GET' });
+    }
+    if (pathname === '/api/open/tasks') {
+      return sendJSON(res, 200, { ok: true, tasks: openApiTasks(), at: nowISO() });
+    }
+    if (pathname === '/api/open/state') {
+      return sendJSON(res, 200, { ok: true, ...publicState('user'), at: nowISO() });
+    }
+    if (pathname === '/api/open/health') {
+      return sendJSON(res, 200, { ok: true, at: nowISO(), uptime: Math.round(process.uptime()), build: SMS_BUILD });
+    }
+    if (pathname === '/api/open/archive') {
+      const days = Math.max(1, Math.min(30, Number(url.searchParams.get('days')) || 7));
+      return sendJSON(res, 200, { ok: true, summary: archiveSummary(days), at: nowISO() });
+    }
+    return sendJSON(res, 404, { ok: false, error: '未知的 Open API 端点' });
+  }
 
   /* ---- 公开接口：健康检查与鉴权状态 ---- */
 
@@ -6874,10 +7895,13 @@ async function handleApi(req, res, url) {
        */
       scheduler: {
         ticking,
+        lastTickAt: lastTickAt ? new Date(lastTickAt).toISOString() : null,
         heldMs: ticking && tickStartedAt ? Date.now() - tickStartedAt : 0,
         stuckCount: tickStuckCount,
         stuckLimitSec: TICK_STUCK_MS / 1000,
         taskDeadlineSec: TASK_DEADLINE_MS / 1000,
+        // 实际总闸按任务超时浮动，最长到 330 秒（单步 300 + 收尾）
+        taskDeadlineMaxSec: TASK_DEADLINE_MAX_MS / 1000,
       },
       // 是否跑在守护进程下：决定「未捕获异常」是退出重启还是降级续跑
       supervised: SUPERVISED,
@@ -7206,11 +8230,20 @@ async function handleApi(req, res, url) {
         error: `凭据续期失败：${String((e && e.message) || e).slice(0, 200)}`, duration: Date.now() - startedAt,
       });
     }
+    /*
+     * 脚本任务按它自己的超时放行：后端允许 300 秒，这里过去写死 60 秒，
+     * 一个正常跑 90 秒的脚本在「测试」里永远只能看到「超过 60 秒」。
+     * 脚本线程本身到点会 terminate，不会泄漏。
+     */
+    const hasScript = !!(config.script && String(config.script).trim());
+    const capMs = hasScript
+      ? Math.min(330000, (Math.max(3, Math.min(300, Number(config.timeoutSec) || 60)) + 20) * 1000)
+      : 60000;
     try {
       const guarded = await Promise.race([
         runHttpSteps(task).then((rr) => ({ rr })),
         new Promise((_, rej) => {
-          const t = setTimeout(() => rej(new Error('测试超过 60 秒，已中止')), 60000);
+          const t = setTimeout(() => rej(new Error(`测试超过 ${Math.round(capMs / 1000)} 秒，已中止`)), capMs);
           if (t.unref) t.unref();
         }),
       ]);
@@ -7219,6 +8252,10 @@ async function handleApi(req, res, url) {
         ok: s.ok !== false,
         status: s.status == null ? null : s.status,
         message: cleanRunMessage(s.message || s.error || ''),
+        // 提取到的字段要露出来：多步骤任务靠它传值，测试时看不到就只能靠猜
+        ...(s.extract && Object.keys(s.extract).length ? { extract: s.extract } : {}),
+        // 脚本步骤把原始输出单列一份：测试面板要能像终端一样看全文
+        ...(s.scriptOutput ? { script: true, text: String(s.text || '').slice(0, 20000) } : {}),
       }));
       return sendJSON(res, 200, {
         ok: true, type: 'http', steps,
@@ -7230,6 +8267,7 @@ async function handleApi(req, res, url) {
         ok: s.ok !== false,
         status: s.status == null ? null : s.status,
         message: cleanRunMessage(s.message || s.error || ''),
+        ...(s.extract && Object.keys(s.extract).length ? { extract: s.extract } : {}),
       })) : [];
       return sendJSON(res, 200, {
         ok: false, type: 'http', steps,
@@ -7586,6 +8624,122 @@ async function handleApi(req, res, url) {
   }
 
   /*
+   * 归档查询：?taskId=xxx 只看一个任务，?days=7 控制周报窗口（默认 7 天）。
+   * 只读接口，跟随 /api/state 的公开口径（归档里只有正文和数值，没有凭据）。
+   */
+  if (pathname === '/api/archive' && method === 'GET') {
+    const days = Math.max(1, Math.min(30, Number(url.searchParams.get('days')) || 7));
+    const taskId = String(url.searchParams.get('taskId') || '').trim();
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const items = (state.archives || []).filter((a) => a && Date.parse(a.at) > cutoff
+      && (!taskId || a.taskId === taskId));
+    return sendJSON(res, 200, {
+      ok: true,
+      days,
+      taskId: taskId || null,
+      summary: archiveSummary(days, taskId),
+      items: items.slice(0, 120),
+      total: items.length,
+      retentionDays: ARCHIVE_DAYS,
+    });
+  }
+  /*
+   * 周报正文（纯服务端聚合，零 AI）：供「每周周报」任务步骤拉取，noticeRaw=text 原样推送。
+   * 只读、跟随公开口径；返回 JSON，text 即完整可读正文，summary 供前端/调试核对。
+   */
+  if (pathname === '/api/report/weekly' && method === 'GET') {
+    const days = Math.max(1, Math.min(30, Number(url.searchParams.get('days')) || 7));
+    // week: last（默认，上一自然周）/ this（本周至今）/ rolling（近 days 天，兼容老行为）
+    const rawWeek = String(url.searchParams.get('week') || '').toLowerCase();
+    const week = rawWeek === 'this' ? 'this' : (rawWeek === 'rolling' ? 'rolling' : 'last');
+    const report = buildWeeklyReport({ week, days });
+    return sendJSON(res, 200, { ok: true, days, at: nowISO(), ...report });
+  }
+  /*
+   * 云端外部状态总览（第四十一批）：把分散在六个地方的「还活着吗」聚到一处。
+   * 只读、不主动打外部接口（那会放大请求、还可能撞风控），全部用最近一次真实结果：
+   *   · 站点：/api/health 的同款本地读数
+   *   · 中继：relayHealth / relayGuard 快照（唯一短信出口）
+   *   · 上游：天气 / 油价任务最近一次归档
+   *   · 渠道：各通道配置是否就绪（不露凭据）
+   *   · 配额：短信今日计数（本地计数，不碰网关）
+   *   · 保活：keepWarm / wake / 页面心跳
+   * 主动探一次走 /api/monitor/probe（带 30 秒缓存，不会刷屏）。
+   */
+  if (pathname === '/api/monitor/probe' && method === 'POST') {
+    if (REQUIRE_PASSWORD && !isAuthed(req)) {
+      return sendJSON(res, 401, { ok: false, error: '未登录或登录已过期' });
+    }
+    const force = url.searchParams.get('force') === '1';
+    if (force) monitorProbe.at = null;
+    const p = await runMonitorProbe(req);
+    return sendJSON(res, 200, { ok: true, ...p });
+  }
+
+  if (pathname === '/api/monitor' && method === 'GET') {
+    const st = state.settings || {};
+    const channels = {};
+    for (const ch of CH_TYPES || []) {
+      const rc = resolveChannel(ch);
+      channels[ch] = { label: rc ? rc.label : ch, ready: !!channelReady(ch), configured: !!(rc && rc.cfg) };
+    }
+    const nm = st.notifyme || {};
+    channels.notifyme = {
+      label: 'NotifyMe',
+      ready: !!nm.enabled && !!(nm.uuid || nm.token || nm.fcm),
+      configured: !!(nm.uuid || nm.token || nm.fcm),
+    };
+    /*
+     * 上游状态看任务本身的 lastResult，不依赖归档。
+     * 归档是后加的旁路数据：新任务、刚改过的任务都还没有归档记录，
+     * 用 archive 判「上游正常」会显示 0/2，把好任务报成坏的。
+     */
+    const recent = archiveSummary(7).tasks;
+    const upstream = ['天气预报', '油价'].map((kw) => {
+      // 合集任务（如「早报·天气+92号油价」）名字里两个关键词都有，不能让它顶掉专项任务
+      const hit = (x) => String(x.name || '').includes(kw) && !String(x.name || '').includes('早报');
+      const t = (state.tasks || []).find(hit);
+      const rec = recent.find(hit);
+      const lr = (t && t.lastResult) || {};
+      return {
+        name: (t && t.name) || (rec && rec.name) || kw,
+        lastAt: (t && t.lastRun) || (rec && rec.lastAt) || null,
+        ok: lr.ok === true ? true : lr.ok === false ? false : null,
+        runs: (t && Number(t.runCount)) || (rec && rec.runs) || 0,
+        body: (rec && rec.lastBody) || '',
+      };
+    });
+    return sendJSON(res, 200, {
+      ok: true,
+      at: nowISO(),
+      site: {
+        uptimeSec: Math.round(process.uptime()),
+        build: SMS_BUILD,
+        ticking,
+        lastTickAt: lastTickAt ? new Date(lastTickAt).toISOString() : null,
+        stateWrites: stateWriteStats(),
+        storage: stateStorageSnapshot(),
+      },
+      relay: { ...relayHealth, guard: { at: relayGuard.at, ok: relayGuard.ok, status: relayGuard.status } },
+      upstream,
+      channels,
+      sms: { records: (state.smsRecords || []).length, credential: state.smsCredential ? { enabled: true } : { enabled: false } },
+      keepAlive: { self: (keepWarm && keepWarm.lastAt) ? { lastAt: keepWarm.lastAt, ok: keepWarm.lastOk } : null, wake: { count: Number((st.wake || {}).count) || 0, lastWokeAt: (st.wake || {}).lastWokeAt || null } },
+      probe: { ...monitorProbe },
+    });
+  }
+
+  if (pathname === '/api/archive' && method === 'DELETE') {
+    const taskId = String(url.searchParams.get('taskId') || '').trim();
+    const before = (state.archives || []).length;
+    state.archives = taskId
+      ? (state.archives || []).filter((a) => a.taskId !== taskId)
+      : [];
+    saveState();
+    return sendJSON(res, 200, { ok: true, removed: before - (state.archives || []).length });
+  }
+
+  /*
    * 复制一套渠道配置：服务端直接抄原始值，绕开前端脱敏串（否则复制出来 token 会变空）。
    * body = { type, from }，from 传 'main' 表示复制默认那套。
    */
@@ -7635,6 +8789,9 @@ async function handleApi(req, res, url) {
       || !!(b.channels && Object.prototype.hasOwnProperty.call(b.channels, 'sms'));
     if (touchesSms && !needSmsAdmin(req, res, '修改短信设置')) return;
     const next = deepMerge(state.settings, body || {});
+    // Open API token 只能由 /api/admin/openapi/token 管理：普通 settings PUT 里
+    // 带回的 openApi（可能是脱敏回显或伪造）一律忽略，防止绕过专用鉴权写入 tokenHash。
+    if (has('openApi')) next.openApi = state.settings.openApi;
     /*
      * 页面上的密码框是空的（掩码不回填），所以空串和掩码串都表示「不修改」。
      * 这里以前只判 '••••••'，导致空串会把已有 SMTP 密码直接抹成空。
@@ -9447,7 +10604,7 @@ const server = http.createServer(async (req, res) => {
  * 只保留 origin + 路径 + 合法的 sharecode，其余参数和杂质一律丢弃。
  *
  * 为什么需要它：休眠诊断时发现线上探活地址被粘成了
- *   https://.../api/health?sharecode=ZDRK2MO6CP**%EF%BC%88%E5%89%8D%E5%BE%80...
+ *   https://.../api/health?sharecode=AB12CD34**%EF%BC%88%E5%89%8D%E5%BE%80...
  * 里面混进了 Markdown 加粗符号和 URL 编码的中文说明，fetch 每次必失败，
  * 于是「自保活」看着开着、实际早就哑了。清洗后这类脏输入直接修好或明确报错。
  */
@@ -9464,7 +10621,7 @@ function normalizeKeepWarmUrl(raw) {
   }
   if (!/^https?:$/.test(u.protocol)) return '';
   const out = new URL(u.origin + u.pathname);
-  // sharecode 后面常跟一堆脏字符，只取开头那段合法的字母数字（如 ZDRK2MO6CP）
+  // sharecode 后面常跟一堆脏字符，只取开头那段合法的字母数字（如 AB12CD34）
   const scRaw = String(u.searchParams.get('sharecode') || '').trim();
   const sc = (scRaw.match(/^[A-Za-z0-9]{4,32}/) || [''])[0];
   if (sc) out.searchParams.set('sharecode', sc);

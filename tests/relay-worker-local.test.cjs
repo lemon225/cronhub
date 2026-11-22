@@ -126,18 +126,17 @@ function authed(p, opts = {}) {
     const j = await r.json();
     ok('header 密钥可用', r.status === 200 && j.user === 'tester');
     const raw = JSON.stringify(j);
-    ok('/__status 不回显密钥', !raw.includes(KEY) && !raw.includes('dcb1470e'));
+    ok('/__status 不回显密钥', !raw.includes(KEY));
     ok('/__status 不回显 sharecode', !raw.includes('sharecode'));
   }
   {
     const r = await call(req('/__status'), {});
     /*
-     * 这里断言的不是「503」而是「403」，因为源码里仍有 RELAY_KEYS_INLINE 兜底：
-     * env 为空时 keyring 也不为空，所以走鉴权而不是「未配置」分支。
-     * 这是一条**守门断言** —— 等密钥迁到 Pages 环境变量、内联常量删掉后，
-     * 这里会变成 503，用例就该跟着改，同时 docs/SMS-CHAIN.md §9 的风险条目要划掉。
+     * 源码里的密钥已清空（公开仓库不带凭据），所以 env 为空时走的是「未配置」分支：
+     * 回 503 而不是 403 —— 这是有意的失败关闭，宁可全拒也不静默放行。
+     * 部署时必须配 RELAY_KEYS，缺了会被 /__status 的 debt 列出来。
      */
-    ok('内联兜底仍生效：env 为空走鉴权（403）而非「未配置」503', r.status === 403,
+    ok('env 未配置 → 503 失败关闭（不再有内联兜底）', r.status === 503,
       'status=' + r.status);
   }
 
@@ -201,7 +200,7 @@ function authed(p, opts = {}) {
     const r = await call(authed('/gtw-ai/api/sms/send?foo=1&key=' + KEY + '&relay_secret=x', {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-relay-host': '5gvas01.cmicmaap.com' },
-      body: 'phone=13800000000&text=hi',
+      body: 'phone=13800138000&text=hi',
     }));
     const up = seen.find((s) => s.url.includes('5gvas01'));
     ok('转发命中上游且状态码透传', !!up && r.status === 403);
@@ -209,7 +208,7 @@ function authed(p, opts = {}) {
     ok('业务 query 保留（foo=1）', !!up && up.url.includes('foo=1'));
     ok('私有 query 剥离（key / relay_secret 不带给网关）',
       !!up && !up.url.includes('key=') && !up.url.includes('relay_secret'));
-    ok('method 与 body 透传', !!up && up.method === 'POST' && up.body === 'phone=13800000000&text=hi');
+    ok('method 与 body 透传', !!up && up.method === 'POST' && up.body === 'phone=13800138000&text=hi');
     ok('私有头剥离（x-relay-secret 不出网）',
       !!up && !up.headers['x-relay-secret'] && !up.headers['x-relay-host']);
     ok('content-type 保留', !!up && up.headers['content-type'] === 'application/x-www-form-urlencoded');
@@ -236,9 +235,9 @@ function authed(p, opts = {}) {
   {
     logBuf.length = 0;
     mode = 'ok';
-    await call(authed('/gtw-ai/api/sms/send', { method: 'POST', body: 'phone=13800000000' }));
+    await call(authed('/gtw-ai/api/sms/send', { method: 'POST', body: 'phone=13800138000' }));
     const joined = logBuf.join('\n');
-    ok('日志只记元数据：不含号码 / 密钥', !joined.includes('13800000000') && !joined.includes(KEY),
+    ok('日志只记元数据：不含号码 / 密钥', !joined.includes('13800138000') && !joined.includes(KEY),
       joined.slice(0, 160));
     ok('日志含 kind 与耗时', /"kind":"forward"/.test(joined) && /"ms":/.test(joined));
   }
@@ -251,11 +250,11 @@ function authed(p, opts = {}) {
     ok('变量齐备时 debt 为空', Array.isArray(j.debt) && j.debt.length === 0, JSON.stringify(j.debt));
   }
   {
-    // 只配密钥、不配唤醒与健康地址 → 两条硬编码债应该自报
+    // 只配密钥、不配唤醒与健康地址 → 两条配置缺项应该自报
     const r = await call(authed('/__status'), { RELAY_KEYS: 'tester:' + KEY });
     const j = await r.json();
-    ok('缺变量时 debt 自报内联凭据（不会静默）',
-      j.debt.includes('wake-token-inline') && j.debt.includes('site-health-sharecode-inline'),
+    ok('缺变量时 debt 自报缺项（不会静默）',
+      j.debt.includes('wake-token-missing') && j.debt.includes('site-health-missing'),
       JSON.stringify(j.debt));
     ok('debt 只报类别、不含凭据值',
       !JSON.stringify(j.debt).includes('wk_') && !JSON.stringify(j.debt).includes('sharecode='));

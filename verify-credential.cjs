@@ -393,9 +393,9 @@ if (mode === 'write') {
     ok('① 凭据不写在代码/配置明文里', scanPlaintext().hits.length === 0);
 
     /* ② 凭据不随前端下发：状态接口只回状态 */
-    const credRoute = (srv.match(/pathname === '\/api\/sms\/credential'[\s\S]{0,300}/) || [''])[0];
+    const credRoute = (srv.match(/pathname === '\/api\/sms\/credential'[\s\S]{0,900}/) || [''])[0];
     ok('② 状态接口只返回状态，不含凭据字段',
-      /\bsmsCred\.status\(\)/.test(credRoute) && !/\btoken\s*:|accessToken|refreshToken\s*:|Enc\b/.test(credRoute),
+      /(?:smsCred|inst)\.status\(\)/.test(credRoute) && !/\btoken\s*:|accessToken|refreshToken\s*:|Enc\b/.test(credRoute),
       credRoute.replace(/\s+/g, ' ').slice(0, 80));
 
     /* ③ 凭据不拼进 URL：发送走 stdin */
@@ -455,7 +455,7 @@ if (mode === 'write') {
     }
 
     /* ⑧ 重新授权不是谁都能点 */
-    ok('⑧ 重新授权要求管理员会话', /function canManageSms[\s\S]{0,600}isAdmin/.test(srv));
+    ok('⑧ 重新授权要求管理员会话', /function canManageSms[\s\S]{0,600}(?:isSmsAdmin|isAdmin)/.test(srv));
     ok('⑧ 授权入口有配额（每天/每小时）', /authPerDay/.test(credSrc) && /authPerHour/.test(credSrc));
     ok('⑧ 没有把 Vault 导出给业务层', !/module\.exports[^\n]*\bVault\b/.test(credSrc));
   }

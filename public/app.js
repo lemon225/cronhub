@@ -292,7 +292,13 @@ async function api(path, opts = {}) {
     throw e;
   }
   let data = {};
-  try { data = await res.json(); } catch { /* 空响应 */ }
+  let raw = '';
+  try {
+    raw = await res.text();
+    data = raw ? JSON.parse(raw) : {};
+  } catch {
+    /* 非 JSON 响应：网关 WAF 拦截页就是这种情况，正文是 HTML */
+  }
 
   if (res.status === 401) {
     // 只有「开了访问控制」时才跳回登录页；否则只是这次操作失败
@@ -303,6 +309,20 @@ async function api(path, opts = {}) {
     throw new Error(data.error || '密码不正确');
   }
   if (!res.ok) {
+    /*
+     * 网关 WAF 的误伤：脚本里写 sleep(30) 会被当成 SQL 注入特征，直接回一张 403 拦截页
+     * （HTML，不是 JSON）。不解释的话前端只会报「请求失败 (403)」，用户完全不知道自己
+     * 哪一步错了。这里点名可能的写法，并指向不会被拦的 wait(ms)。
+     */
+    if (res.status === 403 && !data.error) {
+      const waf = /WAF|拦截页|block/i.test(raw);
+      const err = new Error(waf
+        ? '请求被网关安全策略拦截（HTTP 403）。脚本里 sleep(数字) 这类写法会被当成注入特征，改成 wait(毫秒) 再试'
+        : '请求被拒绝（HTTP 403）');
+      err.status = 403;
+      err.waf = waf;
+      throw err;
+    }
     // 带上服务端 payload（例如短信授权页地址），调用方才能做针对性引导
     const err = new Error(data.error || `请求失败 (${res.status})`);
     err.status = res.status;
@@ -571,6 +591,178 @@ function renderMetrics() {
 }
 
 
+/* ------------------------------------------------------------ 云端状态总览 */
+
+/**
+ * 六组外部状态聚合：站点 / 中继 / 上游 / 渠道 / 短信 / 保活。
+ * 独立接口异步加载（不塞进 /api/state），避免每次 45 秒轮询都重算。
+ */
+let monitorSeq = 0;
+async function loadMonitor() {
+  const box = $('#monitorGrid');
+  if (!box) return;
+  const my = ++monitorSeq;
+  try {
+    const m = await api('/api/monitor');
+    if (my !== monitorSeq) return;
+    S.monitor = m;
+    renderMonitor();
+  } catch { /* 监控卡失败不影响主界面 */ }
+}
+
+function monitorCell(name, state, value, note) {
+  const cls = state === 'ok' ? 'is-ok' : state === 'err' ? 'is-err' : state === 'warn' ? 'is-warn' : 'is-off';
+  return `<div class="monitor-cell ${cls}">
+    <span class="mc-name">${esc(name)}</span>
+    <strong>${esc(value)}</strong>
+    <small>${esc(note)}</small>
+  </div>`;
+}
+
+function renderMonitor() {
+  const box = $('#monitorGrid');
+  if (!box || !S.monitor) return;
+  const m = S.monitor;
+  const site = m.site || {};
+  const relay = m.relay || {};
+  const guard = relay.guard || {};
+  const upstream = Array.isArray(m.upstream) ? m.upstream : [];
+  const chans = m.channels || {};
+  const readyN = Object.values(chans).filter((c) => c && c.ready).length;
+  const chanN = Object.keys(chans).length;
+  const keep = m.keepAlive || {};
+  const probe = m.probe || {};
+  const probeBad = (probe.results || []).filter((r) => !r.ok).length;
+  // ticking 只在 15s 扫描的这一瞬为 true，直接拿它判活会看到经常「调度卡住」
+  const tickAt = site.lastTickAt ? Date.parse(site.lastTickAt) : 0;
+  const alive = site.ticking || (tickAt && Date.now() - tickAt < 120000);
+  box.innerHTML = [
+    monitorCell('本站', alive ? 'ok' : 'warn', alive ? '运行中' : '调度停摆',
+      `build ${esc(site.build || '—')}${tickAt ? ' · 扫描 ' + esc(fmtAgo(site.lastTickAt)) : ''}`),
+    monitorCell('短信中继', guard.ok === true ? 'ok' : guard.ok === false ? 'err' : 'warn',
+      guard.ok === true ? '正常' : guard.ok === false ? '异常' : '未体检',
+      guard.at ? `体检 ${esc(fmtAgo(guard.at))}` : '健康自检每天第 2 步会探'),
+    monitorCell('上游接口', upstream.every((u) => u.ok) && upstream.length ? 'ok' : upstream.some((u) => u.ok === false) ? 'err' : 'warn',
+      `${upstream.filter((u) => u.ok).length}/${upstream.length} 正常`,
+      upstream.map((u) => u.name).join(' · ') || '暂无 HTTP 任务'),
+    monitorCell('推送渠道', readyN ? 'ok' : 'warn', `${readyN}/${chanN} 就绪`, '站点 / NotifyMe / 短信 / Webhook / 邮件'),
+    monitorCell('保活', (keep.wake || {}).count ? 'ok' : 'warn', (keep.wake || {}).count ? `${keep.wake.count} 次唤醒` : '未接入',
+      keep.self && keep.self.lastAt ? `自探活 ${esc(fmtAgo(keep.self.lastAt))}` : '无自探活记录'),
+    monitorCell('实时探活', (probe.results || []).length ? (probeBad ? 'warn' : 'ok') : 'off',
+      (probe.results || []).length ? `${(probe.results || []).length - probeBad}/${(probe.results || []).length} 可达` : '未检测',
+      probe.at ? `上次 ${esc(fmtAgo(probe.at))}` : '点「立即体检」探一次'),
+  ].join('');
+}
+
+/* ------------------------------------------------------------ 归档 / 周报 */
+
+/** 主页归档条：只给「有多少、哪几个任务、最近写了什么」，明细走弹窗。 */
+function renderArchiveStrip() {
+  const card = $('#archiveCard');
+  const box = $('#archiveStrip');
+  if (!card || !box) return;
+  const arc = (S.data && S.data.archive) || {};
+  const tasks = Array.isArray(arc.tasks) ? arc.tasks : [];
+  if (!tasks.length) {
+    card.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  card.hidden = false;
+  box.innerHTML = `
+    <div class="ar-strip-head">
+      <span>归档 <b>${esc(arc.total || 0)}</b> 条</span>
+      <span>成功 <b>${esc(arc.ok || 0)}</b></span>
+      <span class="${arc.fail ? 'is-err' : ''}">失败 <b>${esc(arc.fail || 0)}</b></span>
+      <span>${esc(tasks.length)} 个任务</span>
+    </div>
+    <div class="ar-strip-list">${tasks.slice(0, 6).map((t) => `
+      <button type="button" class="ar-chip" data-archive-task="${esc(t.taskId || t.name)}" title="查看 ${esc(t.name)} 的归档明细">
+        <span class="ar-chip-name">${esc(t.name)}</span>
+        <span class="ar-chip-meta">${esc(t.runs)} 次 · ${esc(t.ok)} 成功</span>
+        <span class="ar-chip-body">${esc(truncate(t.lastBody || '—', 40))}</span>
+      </button>`).join('')}</div>`;
+}
+
+/**
+ * 归档弹窗：id 为空 = 全部任务周报；传 taskId = 单任务明细。
+ * 数据走 /api/archive 现取，不塞进 /api/state（周报要 30 天窗口，state 只带 7 天摘要）。
+ */
+let archiveCtx = { taskId: '', days: 7 };
+async function openArchive(taskId = '') {
+  archiveCtx = { taskId: taskId || '', days: 7 };
+  try {
+    await fetchArchive();
+    $('#archiveModal').hidden = false;
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
+async function fetchArchive() {
+  const q = `?days=${archiveCtx.days}${archiveCtx.taskId ? '&taskId=' + encodeURIComponent(archiveCtx.taskId) : ''}`;
+  const r = await api('/api/archive' + q);
+  const s = r.summary || {};
+  const t = archiveCtx.taskId ? (S.data.tasks || []).find((x) => x.id === archiveCtx.taskId) : null;
+  $('#arTitle').textContent = t ? `归档明细 · ${t.name}` : `数据归档 · 近 ${r.days || 7} 天周报`;
+  $('#arSummary').innerHTML = `
+    <div class="tl-stat"><span>归档</span><strong>${esc(r.total || 0)}</strong></div>
+    <div class="tl-stat"><span>成功</span><strong class="ok">${esc(s.ok || 0)}</strong></div>
+    <div class="tl-stat"><span>失败</span><strong class="${s.fail ? 'err' : ''}">${esc(s.fail || 0)}</strong></div>
+    <div class="tl-stat"><span>任务</span><strong>${esc((s.tasks || []).length)}</strong></div>`;
+  // 单任务时把数值趋势画成一条迷你折线（油价 / 温度这类一眼看涨跌）
+  const trend = $('#arTrend');
+  const series = [];
+  if (archiveCtx.taskId) {
+    for (const it of r.items || []) {
+      if (it.values) series.push({ at: it.at, values: it.values });
+    }
+  }
+  /*
+   * 只画「多条记录都有」的业务数值。
+   * 归档会把响应里的数字全抓下来，其中 code / status / level 这类是技术字段；
+   * 按出现顺序取前 4 个，图上就只剩一条 code 200 的直线。
+   */
+  const TREND_SKIP = new Set(['code', 'status', 'id', 'record_id', 'level', 'degree', 'scale',
+    'probability', 'alpha', 'red', 'green', 'blue']);
+  const freq = new Map();
+  for (const s of series) {
+    for (const [k, v] of Object.entries(s.values || {})) {
+      if (TREND_SKIP.has(k) || typeof v !== 'number' || !Number.isFinite(v)) continue;
+      freq.set(k, (freq.get(k) || 0) + 1);
+    }
+  }
+  const keys = [...freq.entries()].filter(([, n]) => n >= 2)
+    .sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k]) => k);
+  if (series.length >= 2 && keys.length) {
+    trend.hidden = false;
+    trend.innerHTML = keys.map((k) => {
+      const pts = series.map((x) => x.values[k]).filter((v) => typeof v === 'number' && Number.isFinite(v));
+      if (pts.length < 2) return '';
+      const min = Math.min(...pts), max = Math.max(...pts), span = max - min || 1;
+      const path = pts.map((v, i) => `${i ? 'L' : 'M'}${(i / (pts.length - 1) * 100).toFixed(1)},${(30 - ((v - min) / span) * 26).toFixed(1)}`).join(' ');
+      return `<div class="ar-trend-row"><span>${esc(k)}</span><svg viewBox="0 0 100 32" preserveAspectRatio="none"><path d="${path}" fill="none" stroke="currentColor" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg><b>${esc(pts[pts.length - 1])}</b></div>`;
+    }).join('');
+  } else {
+    trend.hidden = true;
+    trend.innerHTML = '';
+  }
+  const box = $('#arList');
+  const trigMap = { schedule: '定时', manual: '手动', catchup: '补跑' };
+  box.innerHTML = (r.items || []).length
+    ? r.items.map((a) => `
+      <div class="tl-item ${a.ok ? '' : 'is-fail'}">
+        <div class="tl-item-head">
+          <span class="tl-at">${esc(fmtDateTime(a.at))}</span>
+          <span class="${a.ok ? 'badge-ok' : 'badge-err'}">${a.ok ? '成功' : '失败'}</span>
+          ${archiveCtx.taskId ? '' : `<span class="tl-name">${esc(a.taskName || '—')}</span>`}
+          <span class="tl-trig">${esc(trigMap[a.trigger] || a.trigger || '—')}</span>
+        </div>
+        <div class="tl-msg">${esc(a.body || '（无正文）')}</div>
+      </div>`).join('')
+    : `<div class="empty">${ICONS.empty}<p>这 ${esc(r.days)} 天还没有归档</p><small>任务每跑一次就留一条，关了通知也会留</small></div>`;
+}
+
 function renderNext() {
   const tasks = S.data.tasks
     .filter((t) => t.enabled && t.nextRun)
@@ -742,7 +934,12 @@ function renderTasks() {
           ${t.type === 'http' && cfg.aiEnabled === false
             ? '<span class="pill pill--ai-off" title="这个任务关闭了 AI 优化，直接发接口原文">AI 关</span>'
             : ''}
+          ${cfg.dependsOn && cfg.dependsOn.taskId
+            ? `<span class="pill pill--dep" title="前置任务成功后才跑">⛓ 依赖</span>` : ''}
+          ${Array.isArray(cfg.steps) && cfg.steps.some((s) => s.critical)
+            ? '<span class="pill pill--critical" title="有关键步骤：失败会让整体记失败">关键步骤</span>' : ''}
           <button type="button" class="task-log-btn" data-act="logs" title="查看这个任务的历史运行日志"><span class="tlb-full">运行日志</span><span class="tlb-mini">日志</span></button>
+        <button type="button" class="task-log-btn" data-act="archive" title="查看这个任务的数据归档与趋势"><span class="tlb-full">数据归档</span><span class="tlb-mini">归档</span></button>
         </div>
         <div class="task-sub">
           ${t.type === 'http'
@@ -2821,16 +3018,28 @@ function keyboardClickable() {
   });
 }
 
+function renderOpenApiStatus() {
+  const st = $('#openApiStatus');
+  if (!st || !S.data) return;
+  const oa = (S.data.settings && S.data.settings.openApi) || {};
+  st.textContent = oa.enabled ? '已启用' + (oa.createdAt ? ' · ' + String(oa.createdAt).slice(0, 10) : '') : '未启用';
+  const closeBtn = $('#openApiClose');
+  if (closeBtn) closeBtn.hidden = !oa.configured;
+}
+
 function renderAll() {
   if (!S.data) return;
   renderStats();
   renderNext();
   renderFeed();
+  renderArchiveStrip();
+  if (S.view === 'overview') loadMonitor();
   renderTasks();
   renderInbox();
   renderLogView();
   // 陪护卡只写文本、不碰任何 input，所以放在编辑门控外面，实时刷新也不会打断填写
   renderCompanion();
+  renderOpenApiStatus();
   draftBanner();
   loadSysMeta();
   /*
@@ -2923,6 +3132,8 @@ function switchView(view) {
   // 切页时把任务日志弹层收掉，避免遮住新页面
   const tlModal = $('#taskLogModal');
   if (tlModal) tlModal.hidden = true;
+  const arModal = $('#archiveModal');
+  if (arModal) arModal.hidden = true;
   $$('.view').forEach((v) => v.classList.toggle('is-active', v.id === `view-${view}`));
   // 隐藏页没有对应导航项，此时把设置项标为激活，让位置感不丢
   const navKey = HIDDEN_VIEWS.includes(view) ? 'settings' : view;
@@ -3076,6 +3287,31 @@ function openModal(task) {
   if ($('#fAiEnabled')) $('#fAiEnabled').checked = c.aiEnabled !== false;
   // 补跑开关：只有显式存过 true 才勾上，老任务默认「允许补跑」
   if ($('#fNoCatchup')) $('#fNoCatchup').checked = c.noCatchup === true;
+  if ($('#fArchive')) $('#fArchive').checked = !c.archive || c.archive.enabled !== false;
+  // 前置任务下拉：只列别的任务，避免自依赖；缺的任务补一条（配置还在但任务已删）
+  const depSel = $('#fDependsOn');
+  if (depSel) {
+    const depId = (c.dependsOn && c.dependsOn.taskId) || '';
+    const others = (S.data.tasks || []).filter((t) => t.id !== S.editingId);
+    depSel.innerHTML = '<option value="">无依赖</option>' + others.map((t) =>
+      `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('')
+      + (depId && !others.some((t) => t.id === depId)
+        ? `<option value="${esc(depId)}">（已删除的任务）</option>` : '');
+    depSel.value = depId || '';
+    if ($('#fDependsHours')) $('#fDependsHours').value = String((c.dependsOn && c.dependsOn.withinHours) || 24);
+  }
+  // 脚本内容回填
+  if ($('#fScript')) $('#fScript').value = c.script || '';
+  // 单次超时：老配置没有这一项，按 15 秒回填（与后端默认一致）
+  if ($('#fTimeoutSec')) {
+    $('#fTimeoutSec').value = String(Math.max(3, Math.min(300, Number(c.timeoutSec) || (c.script ? 60 : 15))));
+    // 打开已有任务时不带「用户手动改过」的标记，否则下面脚本自动抬超时会失效
+    delete $('#fTimeoutSec').dataset.manual;
+  }
+  // 随机延迟回填：min/max 分开填，没配过就留空
+  const rd = c.randomDelaySec;
+  if ($('#fDelayMin')) $('#fDelayMin').value = (rd && Number(rd.min) > 0) ? String(rd.min) : '';
+  if ($('#fDelayMax')) $('#fDelayMax').value = (rd && Number(rd.max) > 0) ? String(rd.max) : '';
   if ($('#fAiInstance')) {
     const opts = ['<option value="">默认（设置页那套）</option>'].concat(
       channelInstancesOf('ai').map((i) => `<option value="${esc(i.id)}">${esc(i.remark || i.id.slice(-4))}${i.enabled === false ? '（未启用）' : ''}</option>`)
@@ -3233,16 +3469,15 @@ function syncAiOpts() {
  *   ② 响应里没有 code 字段，成败只看 HTTP 状态码（无数据是 200 + zeroResult/空数组，不是 204）；
  *   ③ humidity / 降水概率 / 云量都是 0~1 小数，风是 wind.scale 蒲福风级，温度是 {value,unit} 对象。
  */
-const QW_HOST = 'https://jm564xg389.re.qweatherapi.com';
+const QW_HOST = 'https://PASTE_YOUR_QWEATHER_HOST';
 /*
- * 坐标口径：三甲集镇（35.53, 103.68），不是广河县城。
- * GeoAPI 的 city/lookup 只到县级——查「广河县」给的是县城 35.48169,103.57619，
- * 和镇子差十来公里；查「三甲集镇」它甚至会把台湾的「集集镇」匹配回来。
- * 所以这里写死镇子的经纬度，顺序按 v1 路径要求「纬度/经度」。
+ * 坐标口径：模板留占位符，按目的地填「纬度/经度」。
+ * 镇一级要写死坐标：GeoAPI 的 city/lookup 只到县级，查镇名常匹配到同名异地，
+ * 县城坐标和镇子能差十来公里。顺序按 v1 路径要求「纬度/经度」。
  */
-const QW_POS = '35.53/103.68';
+const QW_POS = 'PASTE_LAT/PASTE_LON';
 const WEATHER_PROMPT = [
-  '你是天气播报编辑，地点：甘肃省临夏州广河县三甲集镇（洮河河谷，昼夜温差大）。',
+  '你是天气播报编辑，地点：〈城市·区县〉（可补一句地形特征，例如「河谷，昼夜温差大」）。',
   '',
   '【事实｜最高优先】',
   '· 只用 JSON 里出现的数值和文字，严禁推算；缺的项不写。',
@@ -3317,8 +3552,8 @@ function applyWeatherScene() {
   if (note) {
     note.hidden = false;
     note.textContent = '已填好：实况 / 逐日 / 逐小时 / 预警 / 空气 五个新版 v1 请求（共用一份请求头）+ 每天 7:00 + AI 播报要求。'
-      + '还需改一处：请求头里的 PASTE_YOUR_QWEATHER_KEY 换成你的 KEY。'
-      + '坐标是路径参数「纬度/经度」，默认三甲集镇 35.53/103.68（GeoAPI 只到县级，镇子要写死）；换地点要改全部 5 个地址。'
+      + '还要改三处：接口域名 PASTE_YOUR_QWEATHER_HOST、经纬度 PASTE_LAT/PASTE_LON、请求头里的 PASTE_YOUR_QWEATHER_KEY。'
+      + '坐标是路径参数「纬度/经度」，镇一级要写死（GeoAPI 只到县级）；换地点要改全部 5 个地址。'
       + 'v1 响应没有 code 字段，无预警是 200 + alerts 空数组，所以只看 HTTP 状态码，不设 204。';
   }
   toast('已套用「天气播报」模板（v1 新版接口）');
@@ -3535,6 +3770,9 @@ function describeCron(p) {
 function stepHtml(s, i) {
   const d = s || {};
   const alsoOk = Array.isArray(d.alsoOkStatus) ? d.alsoOkStatus.join(',') : (d.alsoOkStatus || '');
+  // 提取声明用「label=path」一行写完，比子表格轻，回显也直观
+  const extractStr = (Array.isArray(d.extract) ? d.extract : [])
+    .map((f) => (f && f.label ? `${f.label}=${f.path}` : (f && f.path) || '')).filter(Boolean).join(', ');
   return `
   <div class="step-item" data-step="1">
     <div class="step-head">
@@ -3557,7 +3795,12 @@ function stepHtml(s, i) {
     </div>
     <textarea class="st-headers" rows="1" placeholder='请求头 JSON，留空继承'>${esc(d.headers || '')}</textarea>
     <textarea class="st-body" rows="1" placeholder='请求体，留空继承'>${esc(d.body || '')}</textarea>
-    <label class="step-opt"><input type="checkbox" class="st-optional" ${d.optional === true ? 'checked' : ''}> 允许失败（失败后继续执行下一步）</label>
+    <input type="text" class="st-extract" value="${esc(extractStr)}"
+      placeholder="提取字段给后面步骤用：token=data.token, uid=data.user.id">
+    <div class="step-opts">
+      <label class="step-opt"><input type="checkbox" class="st-optional" ${d.optional === true ? 'checked' : ''}> 允许失败（仍继续下一步）</label>
+      <label class="step-opt"><input type="checkbox" class="st-critical" ${d.critical === true ? 'checked' : ''}> 关键步骤（失败则整体记失败）</label>
+    </div>
   </div>`;
 }
 
@@ -3581,25 +3824,45 @@ function setSteps(steps) {
   (steps || []).forEach((s) => addStep(s));
 }
 
-/** 把步骤卡片读回成数据；空 url 且没名称的空卡片会被忽略。 */
+/** 把步骤卡片读回成数据；整张空卡片会被忽略。 */
 function readSteps() {
   const out = [];
   $$('#fSteps .step-item').forEach((el) => {
     const url = el.querySelector('.st-url').value.trim();
     const name = el.querySelector('.st-name').value.trim();
-    if (!url && !name) return; // 整张空白卡片直接丢掉
+    const headers = el.querySelector('.st-headers').value.trim();
+    const body = el.querySelector('.st-body').value.trim();
+    const exEl = el.querySelector('.st-extract');
+    const exRaw = exEl ? exEl.value.trim() : '';
+    /*
+     * 判空不能只看 url/name：只覆盖请求头或只提取字段的步骤（url 继承任务级）
+     * 以前只要有内容、没写名字就被整张丢掉，用户填了 headers 却不生效。
+     */
+    if (!url && !name && !headers && !body && !exRaw) return;
     const alsoRaw = el.querySelector('.st-also').value.trim();
     const item = {
       name: name || undefined,
       method: el.querySelector('.st-method').value,
       url,
-      headers: el.querySelector('.st-headers').value.trim(),
+      headers,
       body: el.querySelector('.st-body').value,
       expectStatus: Number(el.querySelector('.st-expect').value) || 200,
     };
     const also = alsoRaw ? alsoRaw.split(/[\s,;]+/).map(Number).filter((n) => Number.isInteger(n)) : [];
     if (also.length) item.alsoOkStatus = also;
+    // 提取字段：label=path 或纯 path，多个用逗号/分号/换行分隔
+    const extract = exRaw
+      .split(/[,，;；\n]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => {
+        const i = s.indexOf('=');
+        return i > 0 ? { label: s.slice(0, i).trim(), path: s.slice(i + 1).trim() } : { path: s };
+      })
+      .filter((f) => f.path);
+    if (extract.length) item.extract = extract;
     if (el.querySelector('.st-optional').checked) item.optional = true;
+    if (el.querySelector('.st-critical') && el.querySelector('.st-critical').checked) item.critical = true;
     out.push(item);
   });
   return out;
@@ -3638,8 +3901,9 @@ function collectForm() {
   if (S.formType === 'http') {
     const steps = readSteps();
     const url = $('#fUrl').value.trim();
-    // 多步骤任务的主地址可以留空（由第一步兜底），单请求任务必须填
-    if (!url && !steps.length) { hard.push('请填写请求地址，或至少添加一个步骤'); }
+    const script = ($('#fScript') && $('#fScript').value.trim()) || '';
+    // 多步骤任务的主地址可以留空（由第一步兜底），脚本任务也不需要地址，单请求任务必须填
+    if (!url && !steps.length && !script) { hard.push('请填写请求地址、脚本内容，或至少添加一个步骤'); }
     if (url && !/^https?:\/\//i.test(url)) { hard.push('请求地址需要以 http:// 或 https:// 开头'); }
     for (const s of steps) {
       if (s.url && !/^https?:\/\//i.test(s.url)) {
@@ -3658,8 +3922,10 @@ function collectForm() {
       headers,
       body: $('#fBody').value,
       expectStatus: Number($('#fExpect').value) || 200,
-      timeoutSec: 15,
+      // 以前写死 15 秒，脚本超过 15 秒必然失败，后端支持的 300 秒根本用不到
+      timeoutSec: Math.max(3, Math.min(300, Number($('#fTimeoutSec') && $('#fTimeoutSec').value) || 15)),
     };
+    if (script) config.script = script;
     if (also.length) config.alsoOkStatus = also;
     const rTimes = Number($('#fRetryTimes') && $('#fRetryTimes').value) || 0;
     if (rTimes > 0) {
@@ -3696,7 +3962,7 @@ function collectForm() {
   if (S.editingId) {
     const prevTask = (S.data.tasks || []).find((t) => t.id === S.editingId);
     const prevCfg = (prevTask && prevTask.config) || {};
-    for (const k of ['notifyTemplate', 'notifyPrompt', 'aiEnabled', 'aiInstance']) {
+    for (const k of ['notifyTemplate', 'notifyPrompt', 'aiEnabled', 'aiInstance', 'noticeRaw']) {
       if (prevCfg[k] !== undefined && config[k] === undefined) config[k] = prevCfg[k];
     }
   }
@@ -3721,6 +3987,18 @@ function collectForm() {
    */
   const noCatch = $('#fNoCatchup');
   if (noCatch) config.noCatchup = !!noCatch.checked;
+  // 归档开关：显式写 false 才关，默认（含老任务）都归档
+  const arcSw = $('#fArchive');
+  if (arcSw && !arcSw.checked) config.archive = { enabled: false };
+  // 前置任务依赖：选了才写，窗口跟着一起落库
+  const depSel = $('#fDependsOn');
+  if (depSel && depSel.value) {
+    config.dependsOn = { taskId: depSel.value, withinHours: Number(($('#fDependsHours') || {}).value) || 24 };
+  }
+  // 随机延迟：任一格填了正数就写，交给后端 clamp（min/max、3600 上限）
+  const dMin = Number(($('#fDelayMin') || {}).value) || 0;
+  const dMax = Number(($('#fDelayMax') || {}).value) || 0;
+  if (dMin > 0 || dMax > 0) config.randomDelaySec = { min: dMin, max: dMax };
 
   const payload = {
     name,
@@ -3785,7 +4063,14 @@ async function testTask() {
   btn.disabled = true;
   btn.classList.add('is-spin');
   try {
-    const r = await api('/api/tasks/test', { method: 'POST', body: payload, timeout: 70000 });
+    /*
+     * 客户端超时也要跟着脚本走：脚本可以配到 300 秒，写死 70 秒会让一个正常脚本
+     * 在「测试」里提前断开，用户以为脚本卡死了。
+     */
+    const cfgT = Number(payload.config && payload.config.timeoutSec) || 15;
+    const isScript = !!(payload.config && payload.config.script);
+    const cliTimeout = isScript ? Math.min(340000, (Math.max(3, Math.min(300, cfgT)) + 30) * 1000) : 70000;
+    const r = await api('/api/tasks/test', { method: 'POST', body: payload, timeout: cliTimeout });
     if (r.type === 'remind') {
       out.innerHTML = `<div class="tr-head is-ok">✓ ${esc(r.message)}</div>`;
       out.hidden = false;
@@ -3795,9 +4080,13 @@ async function testTask() {
     const head = r.ok
       ? `✓ 测试通过 · ${steps.length} 步 · ${r.duration}ms`
       : `✕ 测试失败 · ${r.duration}ms`;
-    const rows = steps.map((s) => (
-      `<div class="tr-step ${s.ok ? 'is-ok' : 'is-err'}"><span class="tr-mark">${s.ok ? '✓' : '✕'}</span><b>${esc(s.name || '步骤')}</b>${s.status == null ? '' : ` <span class="tr-status">${s.status}</span>`}<span class="tr-msg">${esc(s.message)}</span></div>`
-    )).join('');
+    const rows = steps.map((s) => {
+      const ex = (s.extract && Object.keys(s.extract).length)
+        ? `<span class="tr-ex">提取 ${Object.entries(s.extract).map(([k, v]) => `${k}=${v}`).join(' · ')}</span>`
+        : '';
+      return `<div class="tr-step ${s.ok ? 'is-ok' : 'is-err'}"><span class="tr-mark">${s.ok ? '✓' : '✕'}</span><b>${esc(s.name || '步骤')}</b>${s.status == null ? '' : ` <span class="tr-status">${s.status}</span>`}<span class="tr-msg">${esc(s.script ? `脚本执行成功 · ${r.duration}ms` : s.message)}</span>${ex}</div>`
+        + (s.script && s.text ? `<pre class="tr-out">${esc(s.text)}</pre>` : '');
+    }).join('');
     const fail = r.ok ? '' : `<div class="tr-fail">${esc(r.error || '')}</div>`;
     out.innerHTML = `<div class="tr-head ${r.ok ? 'is-ok' : 'is-err'}">${head}</div>${fail}${rows}`;
     out.hidden = false;
@@ -4753,6 +5042,24 @@ async function testChannel(channel, btn) {
 function bind() {
   bindChannelTabs();
 
+  // 深浅主题切换：按钮图标随当前主题更新，选择写入 localStorage（head 内联脚本负责首屏无闪烁）
+  const themeBtn = $('#themeBtn');
+  if (themeBtn) {
+    const applyTheme = (t) => {
+      document.documentElement.setAttribute('data-theme', t);
+      const icon = $('#themeIcon');
+      if (icon) icon.innerHTML = t === 'dark'
+        ? '<circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'
+        : '<path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/>';
+    };
+    applyTheme(document.documentElement.getAttribute('data-theme') || 'light');
+    themeBtn.addEventListener('click', () => {
+      const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      applyTheme(next);
+      try { localStorage.setItem('cronhub.theme', next); } catch (e) { /* 隐私模式忽略 */ }
+    });
+  }
+
   // 设置页：点未配置渠道的标题行展开（委托到 document，卡片重建后照样生效）
   document.addEventListener('click', (e) => {
     const head = e.target.closest('.ch-fold-head');
@@ -4913,8 +5220,38 @@ function bind() {
   $('#taskLogModal').addEventListener('click', (e) => {
     if (e.target.closest('[data-tl-close]')) $('#taskLogModal').hidden = true;
   });
+  const arModal = $('#archiveModal');
+  arModal.addEventListener('click', (e) => {
+    if (e.target.closest('[data-ar-close]')) arModal.hidden = true;
+    const chip = e.target.closest('[data-archive-task]');
+    if (chip) openArchive(chip.dataset.archiveTask);
+  });
+  $('#archiveCard').addEventListener('click', (e) => {
+    if (e.target.closest('[data-act="archive-all"]')) openArchive('');
+  });
+  $('#arRefresh').addEventListener('click', async () => {
+    try { await fetchArchive(); toast('归档已刷新'); } catch (err) { toast(err.message, 'err'); }
+  });
+  const probeBtn = $('#monitorProbeBtn');
+  if (probeBtn) probeBtn.addEventListener('click', async () => {
+    const old = probeBtn.textContent;
+    probeBtn.textContent = '体检中…';
+    probeBtn.disabled = true;
+    try {
+      await api('/api/monitor/probe?force=1', { method: 'POST' });
+      await loadMonitor();
+      toast('外部状态已刷新');
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      probeBtn.textContent = old;
+      probeBtn.disabled = false;
+    }
+  });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('#taskLogModal').hidden) $('#taskLogModal').hidden = true;
+    if (e.key !== 'Escape') return;
+    if (!$('#taskLogModal').hidden) $('#taskLogModal').hidden = true;
+    if (!arModal.hidden) arModal.hidden = true;
   });
 
   $('#taskList').addEventListener('click', (e) => {
@@ -4946,6 +5283,7 @@ function bind() {
     if (act === 'del') deleteTask(id);
     if (act === 'pin') pinTask(id);
     if (act === 'logs') openTaskLogs(id);
+    if (act === 'archive') openArchive(id);
     if (act === 'edit') {
       const t = S.data.tasks.find((x) => x.id === id);
       if (t) openModal(t);
@@ -6201,6 +6539,93 @@ function bind() {
     toast('数据已导出');
   });
 
+  // 导入任务：只取 tasks，按名称匹配覆盖同名、其余新建；settings/凭据不导入，避免掩码污染
+  const importBtn = $('#importData');
+  const importFile = $('#importFile');
+  if (importBtn && importFile) {
+    importBtn.addEventListener('click', () => importFile.click());
+    importFile.addEventListener('change', async () => {
+      const file = importFile.files && importFile.files[0];
+      importFile.value = ''; // 同一个文件可重复选
+      if (!file) return;
+      let parsed;
+      try {
+        parsed = JSON.parse(await file.text());
+      } catch (e) {
+        toast('文件不是合法 JSON', 'err');
+        return;
+      }
+      // 兼容两种格式：整份导出（含 tasks）或直接任务数组
+      const tasks = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.tasks) ? parsed.tasks : null);
+      if (!tasks) { toast('找不到任务列表（需要 tasks 数组）', 'err'); return; }
+      const valid = tasks.filter((t) => t && typeof t.name === 'string' && t.name.trim());
+      if (!valid.length) { toast('没有可用的任务（缺少名称）', 'err'); return; }
+      const names = new Set((S.data.tasks || []).map((t) => t.name));
+      const overwrite = valid.filter((t) => names.has(t.name.trim())).length;
+      const msg = `导入 ${valid.length} 个任务` + (overwrite ? `，其中 ${overwrite} 个同名会被覆盖` : '')
+        + `。\n${valid.length - overwrite} 个新建。确认继续？`;
+      if (!window.confirm(msg)) return;
+      importBtn.disabled = true;
+      importBtn.textContent = '导入中…';
+      try {
+        // 剥离运行态字段：只保留配置相关，其余交给服务端 sanitizeTask 白名单
+        const items = valid.map((t) => ({
+          name: t.name.trim(), type: t.type === 'remind' ? 'remind' : 'http',
+          enabled: t.enabled !== false, group: typeof t.group === 'string' ? t.group.slice(0, 40) : '',
+          schedule: t.schedule, schedules: t.schedules, config: t.config || {},
+        }));
+        const r = await api('/api/tasks/upsert', { method: 'POST', body: { items } });
+        const okN = (r.created || []).length + (r.updated || []).length;
+        const failN = (r.failed || []).length;
+        toast(`导入完成：成功 ${okN}${failN ? `，失败 ${failN}` : ''}`);
+        if (failN) console.warn('[import] 失败任务', r.failed);
+        await load(true);
+      } catch (e) {
+        toast('导入失败：' + e.message, 'err');
+      } finally {
+        importBtn.disabled = false;
+        importBtn.textContent = '导入任务';
+      }
+    });
+  }
+
+  // 只读 API Token：生成/轮换（明文只显示一次）/关闭
+  const oaGen = $('#openApiGen');
+  const oaClose = $('#openApiClose');
+  const oaBox = $('#openApiTokenBox');
+  if (oaGen) {
+    oaGen.addEventListener('click', async () => {
+      if (!window.confirm('生成新 Token 会让旧 Token 立即失效。继续？')) return;
+      oaGen.disabled = true;
+      try {
+        const r = await api('/api/admin/openapi/token', { method: 'POST' });
+        if (oaBox) {
+          oaBox.hidden = false;
+          oaBox.textContent = r.token + '\n\n请立即复制保存——关闭或刷新后不再显示。';
+        }
+        toast('Token 已生成');
+        await load(true);
+      } catch (e) {
+        toast('生成失败：' + e.message, 'err');
+      } finally {
+        oaGen.disabled = false;
+      }
+    });
+  }
+  if (oaClose) {
+    oaClose.addEventListener('click', async () => {
+      if (!window.confirm('关闭后所有用此 Token 的远程访问会立即失效。继续？')) return;
+      try {
+        await api('/api/admin/openapi/token', { method: 'DELETE' });
+        if (oaBox) { oaBox.hidden = true; oaBox.textContent = ''; }
+        toast('已关闭');
+        await load(true);
+      } catch (e) {
+        toast('关闭失败：' + e.message, 'err');
+      }
+    });
+  }
+
   // 管理身份验证
   $('#authLoginBtn').addEventListener('click', doLogin);
   $('#authPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
@@ -6338,6 +6763,34 @@ function bind() {
   if ($('#fAiPreviewBtn')) $('#fAiPreviewBtn').addEventListener('click', showAiPreview);
   $('#modalSave').addEventListener('click', saveTask);
   $('#modalTest').addEventListener('click', testTask);
+
+  // 脚本框里 Tab 缩进两格；不拦的话 Tab 直接把焦点跳走，写 if/for 嵌套没法排版
+  const scriptBox = $('#fScript');
+  const tBox = $('#fTimeoutSec');
+  // 用户自己动过超时就不再自动改，省得把人手填的值冲掉
+  if (tBox) tBox.addEventListener('input', () => { tBox.dataset.manual = '1'; });
+  if (scriptBox) {
+    /*
+     * 贴进脚本还留着 HTTP 的 15 秒默认值 → 自动抬到 60。
+     * 脚本通常要发好几个请求，15 秒往往刚够第一个，后面的全被砍在半路；
+     * 后端对「脚本任务」的默认值也是 60，这里只是让界面上看到的数一致。
+     */
+    scriptBox.addEventListener('input', () => {
+      if (!tBox || tBox.dataset.manual === '1') return;
+      const n = Number(tBox.value) || 0;
+      if (n && n <= 15) tBox.value = '60';
+    });
+    scriptBox.addEventListener('keydown', (e) => {
+      if (e.key !== 'Tab' || e.shiftKey || e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      const st = scriptBox.selectionStart;
+      const en = scriptBox.selectionEnd;
+      const v = scriptBox.value;
+      scriptBox.value = v.slice(0, st) + '  ' + v.slice(en);
+      scriptBox.selectionStart = scriptBox.selectionEnd = st + 2;
+      scriptBox.dispatchEvent(new Event('input'));
+    });
+  }
 }
 
 /* ------------------------------------------------------------ 启动 */

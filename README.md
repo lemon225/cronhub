@@ -76,6 +76,7 @@ ADMIN_PASSWORDS=chneaki,chen node server.js   # 逗号分隔，可配任意个
 - 两种节奏：标准 5 段 cron（`分 时 日 月 周`）、固定间隔（每 N 分钟）
 - 输入 cron 时实时显示人话翻译；内置 5 个常用预设
 - **多步骤**：一个任务可按顺序串行发多个请求，前一步失败则后续跳过；某步标「允许失败」则失败后继续
+- **步骤传值**：某步声明「提取字段」（如 `token=data.token`），后续步骤用 `{{step1.token}}` 或 `{{步骤名.token}}` 引用；JSON 正文里引用含引号的变量写 `{{json:变量名}}`，值会自动转义
 - **多状态码**：除主期望码外可再声明「也算成功」的码（如 `400`），避免「今天已签到」这类正常状态被记成故障
 - 支持立即执行、暂停/启用、编辑、删除
 - 失败的任务会自动写入告警通知
@@ -328,7 +329,7 @@ node tools/credential-keygen.cjs --file D:\safe\sms.key
 node verify-credential.cjs
 ```
 
-44 项断言，覆盖规范第十条 7 项验收 + 第九条 8 条禁止项：明文扫描、脱敏、落盘密文、100 并发只刷 1 次、重启恢复、删密钥 fail-safe、dry-run 零消耗、吊销后断言。不起服务、不发短信、跑完自动清临时目录。
+46 项断言，覆盖规范第十条 7 项验收 + 第九条 8 条禁止项：明文扫描、脱敏、落盘密文、100 并发只刷 1 次、重启恢复、删密钥 fail-safe、dry-run 零消耗、吊销后断言。不起服务、不发短信、跑完自动清临时目录。
 
 ## 已知限制
 
@@ -338,3 +339,15 @@ node verify-credential.cjs
 - 时区取服务端本地时区，前端只做展示，不做换算
 - 登录失败锁定记录在内存里，服务重启会重置
 - 管理密码写在环境变量里，不能从页面改（这是有意的：改密码需要重启，等于额外一道物理门槛）
+
+## 仓库说明
+
+- **零依赖、单进程**：`git clone` 后 `node server.js` 即可，无需 `npm install`。
+- **不含任何凭据**：接口密钥、唤醒令牌、中继密钥、分享码一律由环境变量或页面配置提供；`data/`、`.secrets/` 已在 `.gitignore` 中，永远不会入库。
+- **中继 Worker 需自备变量**：`relay/_worker.js` 里没有内置密钥，部署前在 Cloudflare 配 `RELAY_KEYS` / `WAKE_TOKEN` / `WAKE_BASE` / `SITE_HEALTH_URL`，缺项会由 `/__status` 的 `debt[]` 列出来。
+- **用例**：`npm test`（`tests/run.cjs` 跑全部，纯本地、不联网、不发短信）。
+- **CI**：`docs/ci.example.yml` 是 GitHub Actions 示例（Node 18/20/22 跑用例）。想要自动跑，把它拷到 `.github/workflows/ci.yml` 即可；推送 workflow 文件需要令牌带 `workflow` scope，故未随仓库附上。
+
+## 许可证
+
+MIT，见 [`LICENSE`](LICENSE)。

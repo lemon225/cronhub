@@ -2,7 +2,7 @@
 
 > 版本：`relay-v5` / `companion-v3` · **2026-11-15 已上线**（`/__status` 回 `ver: relay-v5`）
 > 源码：`relay/_worker.js`（Pages 中继）、`relay/worker-companion.js`（定时陪护 Worker）、`relay/index.html`
-> 线上：`https://cronhub-sms-relay.pages.dev` · 站点 `https://cronhub.app.workbuddy.host/?sharecode=ZDRK2MO6CP`
+> 线上：`https://cronhub-sms-relay.pages.dev` · 站点 `https://cronhub.app.workbuddy.host/?sharecode=<sharecode>`
 > 根因证据、超时预算、判据语义、实测基线、已知限制 → [`SMS-CHAIN.md`](SMS-CHAIN.md)（本文只讲「怎么操作」）
 
 ---
@@ -230,7 +230,7 @@ curl -s -H "Authorization: Bearer $TOK" \
   "https://api.cloudflare.com/client/v4/accounts/$ACCT/workers/scripts/sms-relay/schedules"
 ```
 
-账户 ID：`7c502eedc21c540887e31422d55009ea`
+账户 ID：`<CF_ACCOUNT_ID>`
 
 ### 6.2 Pages 中继（唯一验证可行的组合）
 
@@ -241,7 +241,7 @@ cp <项目>/relay/_worker.js pages-adv/_worker.js
 cp <项目>/relay/index.html pages-adv/index.html
 # 必须 Wrangler 3.28 + 根目录单文件 _worker.js（advanced mode）
 CLOUDFLARE_API_TOKEN=<Pages:Edit 令牌> \
-CLOUDFLARE_ACCOUNT_ID=7c502eedc21c540887e31422d55009ea \
+CLOUDFLARE_ACCOUNT_ID=<CF_ACCOUNT_ID> \
 node <wrangler>/bin/wrangler.js pages deploy pages-adv \
   --project-name cronhub-sms-relay --commit-dirty=true
 ```
@@ -276,7 +276,7 @@ schedules http 200 {"schedules":[{"cron":"*/30 * * * *", ...}]}
 ### 6.4 网站侧
 
 改完 `server.js` 直接部署（用户已长期授权），部署前停本地预览、确认项目内无 `data/state.json`。
-部署后 `GET /api/health?sharecode=ZDRK2MO6CP` 看 `build` 与 `companion`。
+部署后 `GET /api/health?sharecode=<sharecode>` 看 `build` 与 `companion`。
 
 ### 6.5 主 + 备地址（可选）
 
@@ -345,7 +345,7 @@ schedules http 200 {"schedules":[{"cron":"*/30 * * * *", ...}]}
 | 唤醒 401 | 两面令牌比对 | `settings.wake.token` 与 Worker 的 `WAKE_TOKEN`/内置值不一致 → 走 §7 轮换 |
 | 双向体检 502 | `/__guard` 的 `upstream` / `site` | 哪边 `ok:false` 就修哪边；`site.error` 常是分享网关少 `?sharecode=` |
 | 体检结果一直为空 | `/api/health` 的 `companion.guard.at` | 为 null → 网站短命实例没等到每小时钩子；手动 `GET /api/relay/guard` 一次 |
-| 拿到「链接不完整」HTML | URL | 所有站点请求（含静态资源）必须带 `?sharecode=ZDRK2MO6CP`，不是服务挂了 |
+| 拿到「链接不完整」HTML | URL | 所有站点请求（含静态资源）必须带 `?sharecode=<sharecode>`，不是服务挂了 |
 | 云端连 workers.dev 超时 | — | 已否证，别再试；只用 `*.pages.dev` |
 
 **单点风险（如实记录）**：Pages 中继挂了，短信没有任何备用出口。缓解手段只有「尽早发现」——每日自检任务 + 每小时体检 + 唤醒回探 + 失败推手机。做双中继需要另一条云端可达的出口域名，目前没有，暂缓。

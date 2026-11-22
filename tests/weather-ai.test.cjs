@@ -44,7 +44,8 @@ function pure(blockStart, blockEnd, prefix, names) {
 const W = pure('function qwSpan(', '/**\n * 生成推送内容',
   'const RESULT_BODY_MAX=200000;', ['qwSpan', 'summarizeQWeatherStep', 'qWeatherFacts', 'summarizeStepData']);
 const A = pure('function aiRules(', '/**\n * 拼装提示词', '',
-  ['aiRules', 'aiReview', 'aiIconPool', 'dedupeIcons', 'aiFabricationViolations', 'orderBandAfterDay']);
+  ['aiRules', 'aiReview', 'aiIconPool', 'dedupeIcons', 'aiFabricationViolations', 'orderBandAfterDay',
+    'alignWeatherIcons', 'repairNewlines']);
 
 function hour(day, h, text, precip) {
   return {
@@ -90,7 +91,7 @@ function qwFixture(opts = {}) {
     },
     hourly: { hours },
     alert: { alerts: [{ eventType: { name: '道路结冰' }, color: { code: 'yellow' },
-      senderName: '广河县气象台', headline: '广河县气象台发布道路结冰黄色预警信号', // 失效时间必须远离今天：写死成"当天晚些时候"会让这条断言在零点后自己失败
+      senderName: '示例县气象台', headline: '示例县气象台发布道路结冰黄色预警信号', // 失效时间必须远离今天：写死成"当天晚些时候"会让这条断言在零点后自己失败
       expireTime: '2026-12-31T16:20Z' }] },
     air: { indexes: [{ aqi: 43, category: '优' }] },
   };
@@ -127,6 +128,27 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   ok('预警名直接给中文全名，不用模型自己翻译 yellow',
     facts.some((l) => l.includes('预警名=道路结冰黄色预警'))
     && facts.some((l) => l.includes('AQI=43')));
+
+  console.log('\n[2b] 明天行带白天风力');
+  const factsJ = W.qWeatherFacts(stepsOf(j, NAMES));
+  ok('风力只给两字档位：2 级 → 微风，不带风向与级数',
+    factsJ.some((l) => l.startsWith('明天 ') && l.includes('风力=微风') && !/风力=[^ ]*级/.test(l)), factsJ);
+  ok('今晚行不带风力（只标白天）',
+    factsJ.some((l) => l.startsWith('今晚 ') && !l.includes('风力=')), factsJ);
+  const noWind = qwFixture();
+  delete noWind.daily.days[1].daytime.wind;
+  ok('取不到风力时不写这个字段，不留「风力=」空壳',
+    W.qWeatherFacts(stepsOf(noWind, NAMES)).every((l) => !/风力=\s*$/.test(l) && !/风力=无/.test(l)),
+    W.qWeatherFacts(stepsOf(noWind, NAMES)));
+  const calm = qwFixture();
+  calm.daily.days[1].daytime.wind = { scale: 0, direction: { compass: 'n' } };
+  ok('0 级写「无风」，不写「北0级」',
+    W.qWeatherFacts(stepsOf(calm, NAMES)).some((l) => l.includes('风力=无风')));
+  const windy = qwFixture();
+  windy.daily.days[1].daytime.wind = { scale: 5, direction: { compass: 'nw' } };
+  ok('5 级写「大风」，同样不带风向与级数',
+    W.qWeatherFacts(stepsOf(windy, NAMES)).some((l) => l.includes('风力=大风') && !/风力=[^ ]*级/.test(l)),
+    W.qWeatherFacts(stepsOf(windy, NAMES)));
   // 和风会把刚失效的预警一起返回：夜里发的结冰预警，第二天早上还在数组里。
   const expired = qwFixture();
   expired.alert.alerts[0].expireTime = '2026-11-14T16:20Z';
@@ -319,6 +341,61 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
   ok('归一后机检零违规', A.aiReview(fixed, rIcon, text).length === 0);
   ok('带 / 不带 VS16 视为同一图标', /⚠️ 一\n(?!⚠)/u.test(A.dedupeIcons('⚠️ 一\n⚠ 二', pool)));
 
+  console.log('\n[4d] 图标语义对齐：晴天不再顶一个雪花');
+  // 线上实测 11-18 19:12：-6.9°C 晴间多云，两行都写 ❄️ —— 抄的是模板行首，不是天气。
+  ok('晴间多云 → ⛅',
+    A.alignWeatherIcons('❄️ 今晚晴间多云，最低-6.9°C') === '⛅ 今晚晴间多云，最低-6.9°C',
+    A.alignWeatherIcons('❄️ 今晚晴间多云，最低-6.9°C'));
+  ok('小雪仍是 ❄️，雨天是 🌧️',
+    A.alignWeatherIcons('☀️ 明天小雪，-1.9~5.7°C') === '❄️ 明天小雪，-1.9~5.7°C'
+    && A.alignWeatherIcons('❄️ 今晚19-07时小雨，最低3.2°C') === '🌧️ 今晚19-07时小雨，最低3.2°C');
+  ok('今晚单晴走夜景 🌙，明天晴走 ☀️，两行不重复',
+    A.alignWeatherIcons('⛅ 今晚晴，最低-6.9°C\n⛅ 明天晴，-6.9~2.1°C')
+      === '🌙 今晚晴，最低-6.9°C\n☀️ 明天晴，-6.9~2.1°C',
+    A.alignWeatherIcons('⛅ 今晚晴，最低-6.9°C\n⛅ 明天晴，-6.9~2.1°C'));
+  ok('两行都下雪时换用 🌨️，不会又撞成两个 ❄️',
+    A.alignWeatherIcons('❄️ 今晚小雪，最低-3.1°C\n❄️ 明天中雪，-3.1~0.4°C')
+      === '❄️ 今晚小雪，最低-3.1°C\n🌨️ 明天中雪，-3.1~0.4°C');
+  ok('模型漏掉行首图标时按现象补上',
+    A.alignWeatherIcons('今晚多云，最低-1.4°C') === '⛅ 今晚多云，最低-1.4°C');
+  ok('建议行原样保留，即使句子里带「明天」「雨」',
+    A.alignWeatherIcons('⛅ 今晚多云，最低-1.4°C\n☁️ 明天阴，-1.4~5.7°C\n💡 明天有雨，记得带伞')
+      === '⛅ 今晚多云，最低-1.4°C\n☁️ 明天阴，-1.4~5.7°C\n💡 明天有雨，记得带伞');
+  ok('预警行 ⚠️ 不被天气词改写',
+    A.alignWeatherIcons('⛅ 今晚多云\n❄️ 明天小雪\n⚠️ 道路结冰黄色预警；明早慢行')
+      === '⛅ 今晚多云\n❄️ 明天小雪\n⚠️ 道路结冰黄色预警；明早慢行');
+  ok('只换图标，正文一个字不动',
+    A.alignWeatherIcons('❄️ 今晚19-07时小雪，最低-1.4°C').replace(/^\S+\s/, '')
+      === '❄️ 今晚19-07时小雪，最低-1.4°C'.replace(/^\S+\s/, ''));
+  ok('对齐后仍满足「图标全篇不重复」',
+    A.aiReview(A.alignWeatherIcons(dup), rIcon, text).length === 0,
+    A.aiReview(A.alignWeatherIcons(dup), rIcon, text));
+
+  console.log('\n[4e] 换行写成「/n」：只修斜杠，不切 URL');
+  ok('行首 /n 当成换行并去掉空行',
+    A.repairNewlines('/n⛅ 今晚晴间多云，最低-5.7°C') === '⛅ 今晚晴间多云，最低-5.7°C',
+    A.repairNewlines('/n⛅ 今晚晴间多云，最低-5.7°C'));
+  ok('句中 /n 断行', A.repairNewlines('今晚多云，/n明天少云') === '今晚多云，\n明天少云');
+  ok('URL 路径里的 /n 不动',
+    A.repairNewlines('详情 https://x.com/note 已推送') === '详情 https://x.com/note 已推送');
+  ok('本来正常的换行不变', A.repairNewlines('⛅ 今晚多云\n☁️ 明天少云') === '⛅ 今晚多云\n☁️ 明天少云');
+
+  console.log('\n[4f] 现象必须原样照抄：「少云」被写成「空」要抓住');
+  const fph = '今晚 现象=晴间多云 最低=-5.7°C\n明天 现象=少云 最低=-5.7°C 最高=7.8°C';
+  const rPh = A.aiRules(srcPrompt);
+  const phFacts = '【事实结论】\n' + fph;
+  ok('「明天空」判为改写现象',
+    A.aiReview('⛅ 今晚晴间多云，最低-5.7°C\n☀️ 明天空，-5.7~7.8°C', rPh, phFacts)
+      .some((v) => v.hard && /现象应照抄/.test(v.msg)),
+    A.aiReview('⛅ 今晚晴间多云，最低-5.7°C\n☀️ 明天空，-5.7~7.8°C', rPh, phFacts));
+  ok('原样照抄零违规',
+    A.aiReview('⛅ 今晚晴间多云，最低-5.7°C\n☀️ 明天少云，-5.7~7.8°C\n💡 气温低注意保暖', rPh, phFacts).length === 0,
+    A.aiReview('⛅ 今晚晴间多云，最低-5.7°C\n☀️ 明天少云，-5.7~7.8°C\n💡 气温低注意保暖', rPh, phFacts));
+  ok('整行省掉时不当成改字（行数由另一条管）',
+    A.aiReview('⛅ 今晚晴间多云，最低-5.7°C\n☀️ 明天少云，-5.7~7.8°C\n💡 气温低注意保暖', rPh,
+      '【事实结论】\n今晚 现象=晴间多云 最低=-5.7°C')
+      .every((v) => !/现象应照抄/.test(v.msg)));
+
   console.log('\n[4c] 时段顺序归一：模型把时段提到行首时拉回「今晚 / 明天」后面');
   ok('「19-07时今晚小雪」→「今晚19-07时小雪」',
     A.orderBandAfterDay('❄️ 19-07时今晚小雪，最低-1.4°C') === '❄️ 今晚19-07时小雪，最低-1.4°C',
@@ -445,10 +522,10 @@ const NAMES = ['current', 'daily', 'hourly', 'alert', 'air'];
         ok('第二次纠正点名编造的天气内容',
           JSON.stringify(req3.messages).includes('事实结论区没有的内容'), JSON.stringify(req3.messages).slice(-500));
       }
-      const expectBody = '❄️ 今晚多云，最低-1.4°C\n⛅ 明天07-19时小雪，-1.9~5.7°C\n⚠️ 道路结冰黄色预警；明早慢行';
+      const expectBody = '⛅ 今晚多云，最低-1.4°C\n❄️ 明天07-19时小雪，-1.9~5.7°C\n⚠️ 道路结冰黄色预警；明早慢行';
       ok('最终正文为纠正后的合规版本，°C 与重复图标都被确定性归一',
         notes[0] && notes[0].body === expectBody, notes[0] && notes[0].body);
-      ok('aiNote 显示 9 项校验', notes[0] && /已校验 9 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
+      ok('aiNote 显示 10 项校验', notes[0] && /已校验 10 项/.test(notes[0].aiNote || ''), notes[0] && notes[0].aiNote);
       ok('通知原文附上 AI 依据的接口数据（事实结论 + 24 行 hourly）',
         notes[0] && /【AI 依据的接口数据】/.test(notes[0].rawBody || '')
           && /【事实结论/.test(notes[0].rawBody || '')

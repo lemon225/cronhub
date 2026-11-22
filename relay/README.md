@@ -16,7 +16,7 @@ cd D:/Temp/2026-11-08-cloudflare-relay
 cp <项目>/relay/_worker.js pages-adv/_worker.js
 cp <项目>/relay/index.html pages-adv/index.html
 CLOUDFLARE_API_TOKEN=<Pages:Edit 令牌> \
-CLOUDFLARE_ACCOUNT_ID=7c502eedc21c540887e31422d55009ea \
+CLOUDFLARE_ACCOUNT_ID=<CF_ACCOUNT_ID> \
 node node_modules/wrangler/bin/wrangler.js pages deploy pages-adv \
   --project-name cronhub-sms-relay --commit-dirty=true
 
@@ -37,7 +37,7 @@ curl -s -H "X-Relay-Secret: $SECRET" https://cronhub-sms-relay.pages.dev/__statu
 curl -s -H "X-Relay-Secret: $SECRET" https://cronhub-sms-relay.pages.dev/__guard
 
 # ③ 网站侧是否看到陪护状态
-curl -s "https://cronhub.app.workbuddy.host/api/health?sharecode=ZDRK2MO6CP"
+curl -s "https://cronhub.app.workbuddy.host/api/health?sharecode=<sharecode>"
 #    → build / companion.relay / companion.guard / companion.wake
 ```
 

@@ -74,10 +74,19 @@ const WAKE_MIN_INTERVAL_MS = 30000;
 let wakeLastAt = 0;
 let wakeLastResult = null;
 
-const SITE_HEALTH_INLINE = 'https://cronhub.app.workbuddy.host/api/health?sharecode=ZDRK2MO6CP';
-const WAKE_BASE_INLINE = 'https://cronhub.app.workbuddy.host/api/wake?sharecode=ZDRK2MO6CP';
-const WAKE_TOKEN_INLINE = 'wk_fb3cef984be24d36115e34f493c41ff7';
-const RELAY_KEYS_INLINE = 'cronhub:dcb1470eb88f0656d30ec0ac39082e74';
+/*
+ * 内联兜底一律留空：真实值属于部署环境，不进代码库。
+ * 部署前在 Pages 项目里配好这几个变量（缺任一即为「未配置」，不静默降级）：
+ *   RELAY_KEYS       每用户一把，name:key 逗号分隔
+ *   WAKE_TOKEN       唤醒令牌
+ *   WAKE_BASE        唤醒基址（自带 sharecode）
+ *   SITE_HEALTH_URL  站点健康地址（自带 sharecode）
+ * 留空后 keysSource() 会返回 'none'，鉴权直接 503，不会出现「空密钥也放行」。
+ */
+const SITE_HEALTH_INLINE = '';
+const WAKE_BASE_INLINE = '';
+const WAKE_TOKEN_INLINE = '';
+const RELAY_KEYS_INLINE = '';
 
 // 逐跳头 + 中继私有头：转发前必须清干净，否则污染上游 / content-length 不匹配
 const PRIVATE_HEADERS = [
@@ -142,18 +151,21 @@ function keyring(env) {
 function keysSource(env) {
   if (String(env.RELAY_KEYS || '').trim()) return 'env:RELAY_KEYS';
   if (env.RELAY_SECRET) return 'env:RELAY_SECRET';
-  return 'inline';
+  // 源码里的兜底已经清空：没配变量就是「没配」，不能假装还有内联密钥
+  return RELAY_KEYS_INLINE ? 'inline' : 'none';
 }
 
 /**
- * 安全债清单：把「凭据还硬编码在源码里」这件事做成可查询字段。
+ * 配置缺项清单：把「凭据还没配进环境变量」做成可查询字段。
  * 只回类别，不回值 —— /__status 是诊断端点，不是密钥出口。
  */
 function securityDebt(env) {
   const debt = [];
-  if (keysSource(env) === 'inline') debt.push('relay-key-inline');
-  if (!String(env.WAKE_URL || '').trim() && !String(env.WAKE_TOKEN || '').trim()) debt.push('wake-token-inline');
-  if (!String(env.SITE_HEALTH_URL || '').trim()) debt.push('site-health-sharecode-inline');
+  const src = keysSource(env);
+  if (src === 'inline') debt.push('relay-key-inline');
+  if (src === 'none') debt.push('relay-key-missing');
+  if (!String(env.WAKE_URL || '').trim() && !String(env.WAKE_TOKEN || '').trim()) debt.push('wake-token-missing');
+  if (!String(env.SITE_HEALTH_URL || '').trim()) debt.push('site-health-missing');
   return debt;
 }
 

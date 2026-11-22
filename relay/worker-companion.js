@@ -40,8 +40,9 @@ const DEFAULT_HOST = '5gvas01.cmicmaap.com';
 
 // CronHub 外部唤醒地址：Cron Triggers 每 30 分钟打一次，唤醒容器并当场跑一次调度。
 // 换成「基址 + 独立令牌」：线上重置令牌后只需改 Worker 变量 WAKE_TOKEN，不必重新部署脚本。
-const WAKE_BASE_INLINE = 'https://cronhub.app.workbuddy.host/api/wake?sharecode=ZDRK2MO6CP';
-const WAKE_TOKEN_INLINE = 'wk_fb3cef984be24d36115e34f493c41ff7';
+// 真实值不进代码库：部署后由 Worker 变量 WAKE_BASE / WAKE_TOKEN 提供
+const WAKE_BASE_INLINE = '';
+const WAKE_TOKEN_INLINE = '';
 function wakeUrl(env) {
   const explicit = String((env && env.WAKE_URL) || '').trim();
   if (explicit) return explicit;
@@ -97,8 +98,8 @@ async function forwardWithTimeout(url, init, ms) {
   }
 }
 
-// 内置密钥表：name:key, name2:key2 …… 撤销某用户就删掉对应那一段
-const RELAY_KEYS_INLINE = 'cronhub:dcb1470eb88f0656d30ec0ac39082e74';
+// 密钥表只从环境变量来（RELAY_KEYS / RELAY_SECRET）；内置留空，避免仓库里带密钥
+const RELAY_KEYS_INLINE = '';
 
 // 中继私有头 + 逐跳头：转发前清掉，避免污染上游 / 长度不匹配
 const PRIVATE_HEADERS = [
